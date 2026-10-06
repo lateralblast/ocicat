@@ -8,10 +8,33 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.4.1 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.4.2 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+## [0.4.2] - 2026-10-06
+
+### Added
+- `--tail` keeps ragdoll running, polling the source for a sensor until Ctrl-C or SIGTERM. `--poll SECONDS` sets the
+  interval (at least 1, default 30, about how often an iDRAC refreshes its sensors); giving `--poll` starts `--tail`.
+  It defaults to `--source snmp`.
+- `--output` chooses where each reading goes: `text` (a line per reading), `csv`, `raw` (the cache format) or `db`
+  (also spelt `database`), which stores it in the SQLite database (`--db PATH`, or the default) and prints nothing.
+  `--db` with `text` shows and stores.
+- `--output db` also works for a single run, storing the fetched readings and reporting how many are in the database.
+- Counters (`network`) are shown as a rate in the text output while the database keeps the raw counter.
+- `--tail --source web` stores the whole hourly history on the first poll and shows only the newest sample, then shows
+  new samples as they appear.
+- A first poll that fails stops with an error; later failures print a warning and polling continues. Ctrl-C and SIGTERM
+  print a summary. `--tail` does not write the CSV cache but does save limits.
+- `--tail` is rejected with `--list`, `--get`, `--raw` and `--no-fetch`, and with `chart`, `table`, `xlsx` and `xls`.
+  `--poll` below 1 second is rejected.
+- "Polling with --tail" section in the README.
+
+### Changed
+- The README note on the web history's lag now says it looks to be written in batches: on one iDRAC the newest sample
+  stayed put for about 12 hours and then twelve hourly samples appeared together.
 
 ## [0.4.1] - 2026-10-06
 

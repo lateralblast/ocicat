@@ -14,7 +14,7 @@ management-network traffic, through the iDRAC's web interface or over SNMP.
 - [Charts](#charts) and [other outputs](#other-outputs): table, CSV, spreadsheets
 - [Time zones](#time-zones)
 - [Storage](#storage): cache, SQLite database, offline use
-- [Credentials](#credentials) and [running regularly](#running-regularly)
+- [Credentials](#credentials), [running regularly](#running-regularly) and [polling](#polling-with---tail)
 - [Option reference](#option-reference), [example output](#example-output) and [notes](#notes)
 
 ## Install
@@ -572,8 +572,60 @@ sensor changed:
 python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --chart line --last day
 ```
 
-The first run shows a single point. For a quick look at the latest readings as bars, use `--last 12 --chart
+The first run shows a single point. To keep a process running instead of using cron, see [Polling with --tail](#polling-with---tail). For a quick look at the latest readings as bars, use `--last 12 --chart
 horizontal`; for just the current value, use [`--get`](#getting-a-current-value).
+
+## Polling with --tail
+
+`--tail` keeps ragdoll running and polls the source for a sensor, like `tail -f`, until you press Ctrl-C. `--poll`
+sets the seconds between polls (at least 1; the default is 30, about how often an iDRAC refreshes its sensors, so
+polling faster only repeats values). Giving `--poll` starts `--tail` too. It defaults to `--source snmp`, and
+`--metric` and `--sensor` choose the sensor, as elsewhere.
+
+`--output` says where each reading goes:
+
+| `--output` | What each poll does |
+|---|---|
+| `text` (default) | prints a line: `2026-10-06 18:03:58  2880 RPM` |
+| `csv` | prints CSV rows, with a heading once: `time,host,source,metric,sensor,average,peak,unit` |
+| `raw` | prints rows in the stored cache format, `Average,Peak,Time` with UTC times |
+| `db` (or `database`) | stores the reading in the SQLite database and prints nothing |
+
+```
+$ python3 ragdoll.py --host 192.0.2.20 --tail --poll 2 --metric fan --sensor fan4b
+2026-10-06 18:03:58  2880 RPM
+2026-10-06 18:04:00  2880 RPM
+2026-10-06 18:04:03  2880 RPM
+^C
+Stopped after 3 polls.
+```
+
+```
+# log the inlet temperature every minute to the default database, quietly
+python3 ragdoll.py --host 192.0.2.20 --tail --poll 60 --output db
+```
+
+- **The database:** `--output db` uses `--db PATH`, or the default database (`~/.local/share/ragdoll/ragdoll.db`) if
+  `--db` is not given. Each reading goes in as it is polled, in the same table as everything else (see
+  [SQLite database](#sqlite-database)), so charts and `--no-fetch` can use it. `--db` with `--output text` shows each
+  reading and stores it too.
+- **`--output db` also works for a single run** without `--tail`: it stores the fetched readings and says how many are in
+  the database.
+- **Counters:** for `network`, the text output shows a rate in bytes per second between polls, and the database keeps
+  the raw counter, as it does everywhere.
+- **Web source:** `--tail --source web` works but is heavy: each poll downloads the whole hourly history (about 20
+  seconds). The first poll stores all of it in the database and shows only the newest sample; later polls show the
+  samples that are new. The history only gains a sample an hour, so use a long `--poll` such as 3600.
+- **Stopping and errors:** Ctrl-C and SIGTERM stop it cleanly and print a summary (polls made, readings added, polls that
+  failed). A first poll that fails stops it with an error (a wrong sensor name, say); a later one that fails prints a
+  warning and polling carries on, so a short outage does not end a long run.
+- **Not written:** `--tail` does not add to the CSV cache; use `--db` or `--output db` to keep what it reads. It saves the
+  sensor's limits, so `--limits` still works.
+- `--tail` cannot be combined with `--list`, `--get`, `--raw` or `--no-fetch`, and `table`, `chart`, `xlsx` and `xls` are
+  rejected as outputs, because a stream has no table to draw.
+
+A systemd service or a terminal multiplexer is a good place to run it. For one reading every few minutes, cron with
+`--raw` (above) is simpler.
 
 ## Option reference
 
@@ -592,7 +644,7 @@ horizontal`; for just the current value, use [`--get`](#getting-a-current-value)
 | `--community` | SNMP v2c community string |
 | `--save-credentials`, `--forget-credentials` | keep or remove this host's credentials in the OS keyring |
 | `--secure` | verify the iDRAC's TLS certificate |
-| `--output O` | `chart`, `table`, `raw`, `csv`, `xlsx` or `xls`; with `--list` or `--get`, `text`, `table`, `csv`, `xlsx` or `xls` |
+| `--output O` | `chart`, `table`, `raw`, `csv`, `xlsx`, `xls` or `db`; with `--list` or `--get`, `text`, `table`, `csv`, `xlsx` or `xls`; with `--tail`, `text`, `csv`, `raw` or `db` |
 | `--file FILE` | the spreadsheet to write for `xlsx` and `xls` |
 | `--chart C`, `--module M`, `--width W`, `--height H`, `--limits` | chart type, graphing module, size, and limit lines |
 | `--last N\|PERIOD` | how many readings to show (default 10 rows) |
@@ -600,6 +652,7 @@ horizontal`; for just the current value, use [`--get`](#getting-a-current-value)
 | `--tz-offset OFFSET` | the web source's clock offset from UTC, instead of measuring it |
 | `--cachedir DIR`, `--max-age SECONDS`, `--refresh` | the cache directory, how long web data stays fresh, and forcing a fetch |
 | `--db [PATH]` | also store readings in a SQLite database and use it for charts |
+| `--tail`, `--poll SECONDS` | keep polling the source every SECONDS (default 30) and send each reading to `--output` (`text`, `csv`, `raw` or `db`) |
 | `--no-fetch` | show what is already stored without contacting the iDRAC |
 | `--raw` | print every stored reading as CSV and exit (the older flag; see [CSV](#csv)) |
 | `--version`, `--help` | version and full option help |
@@ -744,8 +797,9 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
 - The iDRAC reports temperatures and power supply currents in tenths, and voltages in millivolts; ragdoll converts
   them, so values are always in the units shown (°C, RPM, W, A, Wh, V, B/s or a status code).
 - The "Average" and "Peak" series are identical for SNMP, since each reading is a single value.
-- The web history can lag well behind real time: one iDRAC's newest sample was about 9.5 hours old. Use SNMP for
-  current values.
+- The web history can lag well behind real time. On one iDRAC the newest sample stayed the same for about 12 hours and
+  then twelve hourly samples appeared at once, so it seems to be written in batches (about every 12 hours there). Use
+  SNMP for current values.
 - termgraph does not scale a chart whose values are all identical (common for fans and power on an idle server), so for
   those it draws a full-width bar and shows the value in the label. plotext has no such limitation.
 - The iDRAC web interface ignores unknown sensor names and returns inlet data, which is why sensor names are checked
@@ -756,7 +810,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
 
 ## Version
 
-Current version: **0.4.1**. Print it with `python3 ragdoll.py --version`.
+Current version: **0.4.2**. Print it with `python3 ragdoll.py --version`.
 
 Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.

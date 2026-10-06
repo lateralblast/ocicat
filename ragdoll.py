@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -34,7 +35,7 @@ from pathlib import Path
 import requests
 import urllib3
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 
 class SourceError(Exception):
@@ -625,11 +626,20 @@ def parse_args():
                    help="also store readings in a SQLite database, and chart from it so history from "
                         "earlier runs is included (default path if no PATH: %s)" % default_db_path())
     p.add_argument("--raw", action="store_true", help="print the raw CSV and exit")
+    p.add_argument("--tail", action="store_true",
+                   help="keep running and poll the --source for the sensor, like tail -f, until Ctrl-C; "
+                        "each reading is sent to --output (text, csv, raw or db). Uses --source snmp by default")
+    p.add_argument("--poll", type=float, metavar="SECONDS",
+                   help="seconds between polls in --tail mode (at least 1; default 30, about how often an iDRAC "
+                        "refreshes its sensors); giving --poll starts --tail mode")
     p.add_argument("--output", choices=sorted(set(OUTPUTS) | set(LIST_OUTPUTS)),
+                   type=lambda v: {"database": "db"}.get(v.lower(), v.lower()),
                    help="what to produce. For readings: chart, table, raw (cache format CSV, UTC times), csv "
                         "(CSV with host, sensor and unit columns, times in --tz/local), or xlsx / xls spreadsheets "
                         "(see --file); --module, --chart, --width and --height apply to chart (default: chart). "
-                        "With --list: text, table, csv, xlsx or xls (default: text)")
+                        "With --list: text, table, csv, xlsx or xls (default: text). db (or database) stores the "
+                        "readings in the SQLite database (--db PATH, or the default one); with --tail the choices "
+                        "are text, csv, raw or db (default: text)")
     p.add_argument("--file", metavar="FILE",
                    help="file to write for --output xlsx or xls; if not given, a name is made from the host, "
                         "source, sensor and --last period in the current directory, with the right extension")
@@ -658,9 +668,20 @@ def parse_args():
         p.error("--category, --name and --detail only apply to --list inventory or --get inventory")
     if args.detail and args.field:
         p.error("--detail and --field cannot be used together: --detail already picks what to show")
+    if args.poll is not None:
+        args.tail = True  # giving an interval means polling
+        if args.poll < 1:
+            p.error("--poll must be at least 1 second")
+    if args.tail and (args.list or args.get or args.raw or args.no_fetch):
+        p.error("--tail polls the source, so it cannot be used with --list, --get, --raw or --no-fetch")
     if args.list and args.get:
         p.error("--list and --get cannot be used together")
-    if args.list or args.get:  # plain text unless another format is asked for
+    if args.tail:
+        args.output = args.output or "text"
+        if args.output not in TAIL_OUTPUTS:
+            p.error(f"--output {args.output} does not work with --tail; use one of {', '.join(TAIL_OUTPUTS)}")
+        args.poll = args.poll or DEFAULT_POLL_SECONDS
+    elif args.list or args.get:  # plain text unless another format is asked for
         args.output = args.output or "text"
         if args.output not in LIST_OUTPUTS:
             p.error(f"--output {args.output} does not apply to --list or --get; "
@@ -668,7 +689,9 @@ def parse_args():
     else:
         args.output = args.output or "chart"
         if args.output not in OUTPUTS:
-            p.error(f"--output {args.output} only applies to --list or --get")
+            p.error(f"--output {args.output} only applies to --list, --get or --tail")
+    if args.output == "db":
+        args.db = args.db or default_db_path()  # --output db is the database, so it needs a path
     if args.file:
         if args.output not in ("xlsx", "xls"):
             p.error("--file only applies to --output xlsx or xls")
@@ -1203,8 +1226,13 @@ def output_table(args, metric, rows):
 # Each output is a function output(args, metric, rows) that presents the selected readings, where rows is a list of
 # (unix time in UTC, average, peak) and metric is the METRICS entry. Add new kinds of output (a table, JSON, ...)
 # here and they become available through --output.
+def output_db(args, metric, rows):
+    """--output db: the readings are in the database (main stores them); say so. Never draws anything."""
+    print(f"{len(rows)} readings of {args.sensor} ({args.metric}, {args.source}) are in {args.db}")
+
+
 OUTPUTS = {"chart": output_chart, "table": output_table, "raw": output_raw, "csv": output_csv,
-           "xlsx": output_xlsx, "xls": output_xls}
+           "xlsx": output_xlsx, "xls": output_xls, "db": output_db}
 
 
 def format_limits(limits):
@@ -1680,6 +1708,113 @@ def list_all(args):
     return 0 if records else 1 if failed else 0
 
 
+DEFAULT_POLL_SECONDS = 30  # an iDRAC refreshes its sensors about this often, so polling faster repeats values
+TAIL_OUTPUTS = ("text", "csv", "raw", "db")  # where --tail can send each reading
+
+
+def poll_once(args, state):
+    """Poll the source once. Returns (rows to store, rows to show), each a list of (unix time, average, peak).
+
+    snmp gives one reading, stamped now. web gives its whole hourly history: all of it is stored (rows already in the
+    database are skipped), and the rows newer than the last one shown are displayed (the newest, the first time).
+    """
+    if args.source == "snmp":
+        table = asyncio.run(snmp_read_table(args))
+        if args.sensor not in table:
+            raise SourceError(f"unknown sensor {args.sensor!r}; available: {', '.join(sorted(table))}")
+        reading = table[args.sensor]
+        if reading.limits:
+            save_limits(args, reading.limits)
+        row = (int(time.time()), reading.value, reading.value)
+        return [row], [row]
+    rows = parse_rows(SOURCES[args.source]["fetch"](args))
+    if not rows:
+        return [], []
+    fresh = [r for r in rows if r[0] > state["newest"]] if state.get("newest") else rows[-1:]
+    return rows, fresh
+
+
+def tail_emit(args, metric, rows, state):
+    """Send the rows to the --output: text or csv lines on stdout, raw cache-format lines, or nothing (db)."""
+    unit = metric["unit"](args.sensor).strip()
+    zone = dt.timezone.utc if args.utc else args.tz
+    for t, avg, peak in rows:
+        if args.output == "text":
+            print(f"{dt.datetime.fromtimestamp(t, zone):%Y-%m-%d %H:%M:%S}  {num(avg)} {unit}".rstrip(), flush=True)
+        elif args.output == "csv":
+            writer = csv.writer(sys.stdout, lineterminator="\n")
+            if not state.get("header"):
+                writer.writerow(["time", "host", "source", "metric", "sensor", "average", "peak", "unit"])
+                state["header"] = True
+            when = dt.datetime.fromtimestamp(t, zone)
+            when = when if when.tzinfo else when.astimezone()
+            writer.writerow([when.isoformat(timespec="seconds"), args.host, args.source, args.metric, args.sensor,
+                             num(avg), num(peak), unit])
+            sys.stdout.flush()
+        elif args.output == "raw":
+            if not state.get("header"):
+                print("Average,Peak,Time")
+                state["header"] = True
+            print(f"{num(avg)},{num(peak)},{epoch_to_csv(t)}", flush=True)
+
+
+def tail(args, metric):
+    """Poll the source every --poll seconds until Ctrl-C (or SIGTERM), sending each reading to --output."""
+    if args.source not in ("snmp", "web"):
+        sys.exit(f"--tail needs --source snmp or web, not {args.source}")
+    store = bool(args.db)  # --db stores as well as shows; --output db stores only (parse_args gave it a path)
+    state = {"polls": 0, "stored": 0, "failed": 0}
+    interactive = sys.stderr.isatty()
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)
+    if interactive:
+        where = f"stored in {args.db}" if args.output == "db" else "shown below" + (f" and stored in {args.db}" if store else "")
+        print(f"Polling {args.sensor} ({args.metric}, {args.source}) on {args.host} every {args.poll:g} s, {where}; "
+              "Ctrl-C to stop.", file=sys.stderr)
+    next_tick = time.monotonic()
+    try:
+        while True:
+            try:
+                to_store, to_show = poll_once(args, state)
+            except (requests.RequestException, SourceError) as e:
+                if state["polls"] == 0:
+                    sys.exit(f"Failed to poll {args.host}: {e}")  # a first poll that fails is a mistake, not an outage
+                state["failed"] += 1
+                print(f"warning: poll failed, will try again ({e})", file=sys.stderr)
+            else:
+                shown = to_show
+                if metric.get("counter"):  # show a rate between polls; the database keeps the counter
+                    previous = state.get("previous")
+                    shown = to_rates([previous, to_show[0]]) if previous and to_show else []
+                    state["previous"] = to_show[0] if to_show else previous
+                if store and to_store:
+                    try:
+                        state["stored"] += store_rows(args, to_store)
+                    except (sqlite3.Error, ValueError, OSError) as e:
+                        print(f"warning: could not store in {args.db}: {e}", file=sys.stderr)
+                tail_emit(args, metric, shown, state)
+                if to_show:
+                    state["newest"] = max(r[0] for r in to_show) if args.source == "web" else state.get("newest")
+                state["polls"] += 1
+                if interactive and args.output == "db" and to_store:
+                    print(f"{dt.datetime.now():%H:%M:%S}  stored {num(to_store[-1][1])} {metric['unit'](args.sensor).strip()}"
+                          f" ({state['stored']} new in all)", file=sys.stderr)
+            next_tick += args.poll
+            pause = next_tick - time.monotonic()
+            if pause < 0:  # the poll took longer than the interval: carry on from now, not from the missed ticks
+                next_tick = time.monotonic()
+            else:
+                time.sleep(pause)
+    except KeyboardInterrupt:
+        pass
+    print(f"Stopped after {state['polls']} polls"
+          + (f", {state['stored']} readings added to {args.db}" if store else "")
+          + (f", {state['failed']} failed" if state["failed"] else "") + ".", file=sys.stderr)
+    return 0
+
+
 COUNTER_SAMPLE_SECONDS = 2  # --get on a counter metric waits this long between its two readings
 
 
@@ -1756,7 +1891,7 @@ def main():
         sys.exit(list_all(args))
     if args.get:
         sys.exit(get_value(args))
-    args.source = args.source or "web"
+    args.source = args.source or ("snmp" if args.tail else "web")  # polling is for live values, which snmp gives
     args.metric = args.metric or "temperature"
     if not SOURCES[args.source]["metrics"]:
         sys.exit(f"the {args.source} source only provides the inventory: use --list inventory or --get inventory")
@@ -1765,6 +1900,8 @@ def main():
                  f"it supports: {', '.join(SOURCES[args.source]['metrics'])}")
     metric = METRICS[args.metric]
     args.sensor = args.sensor or metric["default"]
+    if args.tail:
+        sys.exit(tail(args, metric))
     if args.no_fetch:
         text, data = stored_data(args)
     else:
@@ -1773,11 +1910,17 @@ def main():
         except (requests.RequestException, SourceError) as e:
             sys.exit(f"Failed to fetch data from {args.host}: {e}")
         data = parse_rows(text)
+        added = 0
         if args.db and data:
             try:
-                store_rows(args, data)
+                added = store_rows(args, data)
             except (sqlite3.Error, ValueError, OSError) as e:
                 sys.exit(f"Could not store readings in {args.db}: {e}")
+        if args.output == "db":
+            output_db(args, metric, data)  # the raw readings, before any counter is turned into a rate
+            if sys.stderr.isatty():
+                print(f"{added} new", file=sys.stderr)
+            return
 
     if args.raw:
         print(to_csv(data) if data or text is None else text, end="")
