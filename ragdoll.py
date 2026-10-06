@@ -37,7 +37,7 @@ from pathlib import Path
 import requests
 import urllib3
 
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 
 
 class SourceError(Exception):
@@ -634,18 +634,19 @@ def parse_args():
     p.add_argument("--raw", action="store_true", help="print the raw CSV and exit")
     p.add_argument("--tail", action="store_true",
                    help="keep running and poll the --source for the sensor, like tail -f, until Ctrl-C; "
-                        "each reading is sent to --output (text, csv, raw or db). Uses --source snmp by default")
+                        "each reading is sent to --output (text, csv, json, raw or db). Uses --source snmp by default")
     p.add_argument("--poll", type=float, metavar="SECONDS",
                    help="seconds between polls in --tail mode (at least 1; default 30, about how often an iDRAC "
                         "refreshes its sensors); giving --poll starts --tail mode")
     p.add_argument("--output", choices=sorted(set(OUTPUTS) | set(LIST_OUTPUTS)),
                    type=lambda v: {"database": "db"}.get(v.lower(), v.lower()),
                    help="what to produce. For readings: chart, table, raw (cache format CSV, UTC times), csv "
-                        "(CSV with host, sensor and unit columns, times in --tz/local), or xlsx / xls spreadsheets "
+                        "(CSV with host, sensor and unit columns, times in --tz/local), json (the same as a JSON array), or "
+                        "xlsx / xls spreadsheets "
                         "(see --file); --module, --chart, --width and --height apply to chart (default: chart). "
-                        "With --list: text, table, csv, xlsx or xls (default: text). db (or database) stores the "
+                        "With --list or --get: text, table, csv, json, xlsx or xls (default: text). db (or database) stores the "
                         "readings in the SQLite database (--db PATH, or the default one); with --tail the choices "
-                        "are text, csv, raw or db (default: text)")
+                        "are text, csv, json (JSON Lines), raw or db (default: text)")
     p.add_argument("--file", metavar="FILE",
                    help="file to write for --output xlsx or xls; if not given, a name is made from the host, "
                         "source, sensor and --last period in the current directory, with the right extension")
@@ -1303,6 +1304,32 @@ def output_raw(args, metric, rows):
     sys.stdout.write(to_csv(rows))
 
 
+def json_number(value):
+    """A reading as a JSON number: 23.0 -> 23, 0.2 -> 0.2, a missing value -> null."""
+    if value is None:
+        return None
+    value = float(value)
+    return int(value) if value.is_integer() else value
+
+
+def iso_time(args, t):
+    """ISO 8601 time with its UTC offset, in --tz, UTC with --utc, or this computer's local time."""
+    when = dt.datetime.fromtimestamp(t, dt.timezone.utc if args.utc else args.tz)
+    return (when if when.tzinfo else when.astimezone()).isoformat(timespec="seconds")
+
+
+def dump_json(data):
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def output_json(args, metric, rows):
+    """Print the selected readings as a JSON array, one object per reading, times as in --output csv."""
+    unit = metric["unit"](args.sensor).strip()
+    dump_json([{"time": iso_time(args, t), "host": args.host, "source": args.source, "metric": args.metric,
+                "sensor": args.sensor, "average": json_number(avg), "peak": json_number(peak), "unit": unit}
+               for t, avg, peak in rows])
+
+
 def output_csv(args, metric, rows):
     """Print the selected readings as CSV with one self-describing row per reading, times in --tz/--utc/local."""
     zone = dt.timezone.utc if args.utc else args.tz
@@ -1438,7 +1465,7 @@ def output_db(args, metric, rows):
     print(f"{len(rows)} readings of {args.sensor} ({args.metric}, {args.source}) are in {args.db}")
 
 
-OUTPUTS = {"chart": output_chart, "table": output_table, "raw": output_raw, "csv": output_csv,
+OUTPUTS = {"chart": output_chart, "table": output_table, "raw": output_raw, "csv": output_csv, "json": output_json,
            "xlsx": output_xlsx, "xls": output_xls, "db": output_db}
 
 
@@ -1584,6 +1611,16 @@ def list_csv(args, records):
     emit_csv(*select_field(args, *list_data_rows(records)))
 
 
+def list_json(args, records):
+    """The sensors as a JSON array. The fields are those of the text output, with the limits as an object."""
+    head = [h.lower() for h in LIST_HEADER]
+    rows = [[source, metric, sensor, unit, json_number(value),
+             {k: json_number(limits.get(k)) for k in LIMIT_KEYS} if limits else None, key]
+            for source, metric, sensor, unit, value, limits, key in records]
+    head, rows = select_field(args, head, rows)
+    dump_json([dict(zip(head, row)) for row in rows])
+
+
 def list_spreadsheet_path(args, extension):
     """--file, or <host>_sensors[_<source>][_<metric>] in the current directory."""
     if args.file:
@@ -1605,7 +1642,8 @@ def list_xls(args, records):
     emit_spreadsheet("xls", list_spreadsheet_path(args, ".xls"), "Sensors", head, rows, "sensor")
 
 
-LIST_OUTPUTS = {"text": list_text, "table": list_table, "csv": list_csv, "xlsx": list_xlsx, "xls": list_xls}
+LIST_OUTPUTS = {"text": list_text, "table": list_table, "csv": list_csv, "json": list_json, "xlsx": list_xlsx,
+                "xls": list_xls}
 
 
 # --- Redfish: the same inventory over the iDRAC's Redfish API ---
@@ -1828,6 +1866,13 @@ def inventory_csv(args, records):
     emit_csv(*select_field(args, *inventory_data_rows(records)))
 
 
+def inventory_json(args, records):
+    """The inventory as a JSON array of {category, name, details}, details being an object of attribute: value."""
+    head, rows = select_field(args, ["category", "name", "details"],
+                              [[category, name, dict(details)] for category, name, details in records])
+    dump_json([dict(zip(head, row)) for row in rows])
+
+
 def inventory_xlsx(args, records):
     head, rows = select_field(args, *inventory_data_rows(records))
     emit_spreadsheet("xlsx", inventory_spreadsheet_path(args, ".xlsx"), "Inventory", head, rows, "attribute")
@@ -1838,7 +1883,7 @@ def inventory_xls(args, records):
     emit_spreadsheet("xls", inventory_spreadsheet_path(args, ".xls"), "Inventory", head, rows, "attribute")
 
 
-INVENTORY_OUTPUTS = {"text": inventory_text, "table": inventory_table, "csv": inventory_csv,
+INVENTORY_OUTPUTS = {"text": inventory_text, "table": inventory_table, "csv": inventory_csv, "json": inventory_json,
                      "xlsx": inventory_xlsx, "xls": inventory_xls}
 
 
@@ -1919,7 +1964,7 @@ def list_all(args):
 
 
 DEFAULT_POLL_SECONDS = 30  # an iDRAC refreshes its sensors about this often, so polling faster repeats values
-TAIL_OUTPUTS = ("text", "csv", "raw", "db")  # where --tail can send each reading
+TAIL_OUTPUTS = ("text", "csv", "json", "raw", "db")  # where --tail can send each reading
 
 
 def poll_once(args, state):
@@ -1961,6 +2006,10 @@ def tail_emit(args, metric, rows, state):
             writer.writerow([when.isoformat(timespec="seconds"), args.host, args.source, args.metric, args.sensor,
                              num(avg), num(peak), unit])
             sys.stdout.flush()
+        elif args.output == "json":  # JSON Lines: one compact object per line, so a stream can be read as it arrives
+            print(json.dumps({"time": iso_time(args, t), "host": args.host, "source": args.source, "metric": args.metric,
+                              "sensor": args.sensor, "average": json_number(avg), "peak": json_number(peak),
+                              "unit": unit}, ensure_ascii=False), flush=True)
         elif args.output == "raw":
             if not state.get("header"):
                 print("Average,Peak,Time")
@@ -2072,8 +2121,17 @@ def get_text(args, records):
     print(f"{num(value)} {unit}".strip())
 
 
+def get_json(args, records):
+    """--get as JSON is one object, not an array: the same fields as one row of --list."""
+    source, metric, sensor, unit, value, limits, key = records[0]
+    head, row = select_field(args, [h.lower() for h in LIST_HEADER],
+                             [[source, metric, sensor, unit, json_number(value),
+                               {k: json_number(limits.get(k)) for k in LIMIT_KEYS} if limits else None, key]])
+    dump_json(dict(zip(head, row[0])))
+
+
 # --get shows its one record like --list does, except that plain text is the bare value
-GET_OUTPUTS = {**LIST_OUTPUTS, "text": get_text}
+GET_OUTPUTS = {**LIST_OUTPUTS, "text": get_text, "json": get_json}
 
 
 def main():

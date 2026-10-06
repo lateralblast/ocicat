@@ -8,10 +8,27 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.4.5 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.4.6 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+## [0.4.6] - 2026-10-06
+
+### Added
+- `--output json` for every kind of output:
+  - readings: a JSON array of objects with the fields of `--output csv` (time with its UTC offset, host, source, metric,
+    sensor, average, peak, unit);
+  - `--list`: an array of objects with `source`, `metric`, `sensor`, `unit`, `value`, `limits` (an object, or `null`) and
+    `key`;
+  - `--get`: a single object, with the same fields;
+  - the inventory (`--list inventory`, `--get inventory`): an array of `{category, name, details}` where `details` is an
+    object of attribute and value (strings, as in the text listing);
+  - `--tail`: JSON Lines, one compact object per poll.
+- Numbers are JSON numbers (`15`, not `15.0`), a missing value or limit is `null`, and non-ASCII text such as `°C` is not
+  escaped.
+- `--field` and `--detail` work with JSON: `--get --field value --output json` prints `{"value": 15}`.
+- "JSON" section in the README.
 
 ## [0.4.5] - 2026-10-06
 

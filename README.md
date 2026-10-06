@@ -156,6 +156,7 @@ web     temperature  inlet    °C       14  warn 3..42 crit -7..47  iDRAC.Embedd
 | `text` | the aligned plain text above (the default) |
 | `table` | a bordered table, using `terminaltables` |
 | `csv` | CSV, one row per sensor |
+| `json` | a JSON array, one object per sensor (see [JSON](#json)) |
 | `xlsx`, `xls` | a spreadsheet with one `Sensors` sheet, named with `--file` or, without it, `<host>_sensors[_<source>][_<metric>]` in the current directory |
 
 `chart` and `raw` are for readings and are rejected with `--list`, and `--output text` is only for `--list`.
@@ -389,6 +390,7 @@ python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor inlet --last day --c
 | `chart` | a terminal chart (the default) |
 | `table` | a table, oldest first |
 | `csv` | CSV for spreadsheets, databases and scripts |
+| `json` | a JSON array, one object per reading |
 | `raw` | CSV in the form ragdoll stores |
 | `xlsx`, `xls` | a spreadsheet, named with `--file` |
 
@@ -408,6 +410,60 @@ column is in local time, or the zone given with `--tz` or `--utc`, and the zone 
 `--output raw` is not the same as the older `--raw` flag. `--raw` prints every stored reading, ignores `--last`, and
 exits before any other output is chosen; it is kept so existing scripts and cron jobs keep working. `--output raw`
 prints only the selected readings.
+
+### JSON
+
+`--output json` prints JSON, for scripts and programs that would rather not parse CSV. It works with readings, with
+`--list` and `--get`, and with `--tail`. Numbers are JSON numbers, a missing value is `null`, and strings are not
+escaped (`"°C"` stays `"°C"`). Times are ISO 8601 with their UTC offset, in local time or the zone from `--tz` or `--utc`,
+as in the CSV.
+
+```
+$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 2 --output json
+[
+  {
+    "time": "2026-10-06T17:00:30+11:00",
+    "host": "192.0.2.20",
+    "source": "web",
+    "metric": "temperature",
+    "sensor": "inlet",
+    "average": 16,
+    "peak": 16,
+    "unit": "°C"
+  },
+  ...
+]
+```
+
+- **Readings** are an array of objects with the same fields as `--output csv`.
+- **`--list`** is an array of objects with the fields of the text listing (`source`, `metric`, `sensor`, `unit`, `value`,
+  `limits`, `key`), where `limits` is an object with `lower_critical`, `lower_warning`, `upper_warning` and
+  `upper_critical`, or `null` for a sensor without limits.
+- **`--get`** is a single object, not an array. `--field` keeps one key: `--get --field value --output json` prints
+  `{"value": 15}`.
+- **The inventory** is an array of `{"category", "name", "details"}`, where `details` is an object of attribute and value.
+  The values are strings, as in the text listing (`"32 GiB"`, `"16"`), because they carry units and a serial number can
+  look like a number. `--detail` leaves just that attribute in `details`, and `--field details` keeps only that key.
+- **`--tail`** prints [JSON Lines](https://jsonlines.org): one compact object per line, one per poll, so it can be read as
+  it arrives (`... --tail --output json | jq .average`).
+
+```
+$ python3 ragdoll.py --host 192.0.2.20 --get --output json
+{
+  "source": "snmp",
+  "metric": "temperature",
+  "sensor": "inlet",
+  "unit": "°C",
+  "value": 15,
+  "limits": {
+    "lower_critical": -7,
+    "lower_warning": 3,
+    "upper_warning": 42,
+    "upper_critical": 47
+  },
+  "key": "1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.1"
+}
+```
 
 ### Spreadsheets
 
@@ -658,6 +714,7 @@ polling faster only repeats values). Giving `--poll` starts `--tail` too. It def
 |---|---|
 | `text` (default) | prints a line: `2026-10-06 18:03:58  2880 RPM` |
 | `csv` | prints CSV rows, with a heading once: `time,host,source,metric,sensor,average,peak,unit` |
+| `json` | prints [JSON Lines](https://jsonlines.org): one compact JSON object per reading |
 | `raw` | prints rows in the stored cache format, `Average,Peak,Time` with UTC times |
 | `db` (or `database`) | stores the reading in the SQLite database and prints nothing |
 
@@ -714,7 +771,7 @@ A systemd service or a terminal multiplexer is a good place to run it. For one r
 | `--community` | SNMP v2c community string |
 | `--save-credentials`, `--forget-credentials` | keep or remove this host's credentials in the OS keyring |
 | `--secure` | verify the iDRAC's TLS certificate |
-| `--output O` | `chart`, `table`, `raw`, `csv`, `xlsx`, `xls` or `db`; with `--list` or `--get`, `text`, `table`, `csv`, `xlsx` or `xls`; with `--tail`, `text`, `csv`, `raw` or `db` |
+| `--output O` | `chart`, `table`, `raw`, `csv`, `json`, `xlsx`, `xls` or `db`; with `--list` or `--get`, `text`, `table`, `csv`, `json`, `xlsx` or `xls`; with `--tail`, `text`, `csv`, `json`, `raw` or `db` |
 | `--file FILE` | the spreadsheet to write for `xlsx` and `xls` |
 | `--chart C`, `--module M`, `--width W`, `--height H`, `--limits` | chart type, graphing module, size, and limit lines |
 | `--last N\|PERIOD` | how many readings to show (default 10 rows) |
@@ -880,7 +937,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
 
 ## Version
 
-Current version: **0.4.5**. Print it with `python3 ragdoll.py --version`.
+Current version: **0.4.6**. Print it with `python3 ragdoll.py --version`.
 
 Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
