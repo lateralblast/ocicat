@@ -1,3 +1,5 @@
+![ragdoll](ragdoll.jpg)
+
 # ragdoll
 
 Redfish/API/GUI/DRAC/Other Log Linter - Converts iDRAC Telemetry and other information into more useful formats.
