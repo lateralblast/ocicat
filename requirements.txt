@@ -7,3 +7,5 @@ keyring
 terminaltables
 XlsxWriter
 xlwt
+python-dracclient
+six

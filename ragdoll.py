@@ -21,6 +21,7 @@ import datetime as dt
 import getpass
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -37,7 +38,7 @@ from pathlib import Path
 import requests
 import urllib3
 
-__version__ = "0.4.6"
+__version__ = "0.4.9"
 
 
 class SourceError(Exception):
@@ -577,7 +578,7 @@ def parse_args():
     p.add_argument("--source", choices=sorted(SOURCES), type=lambda v: SOURCE_ALIASES.get(v.lower(), v.lower()),
                    help="where sensor data comes from: web is the iDRAC web interface (history), "
                         "snmp reads the current value and builds history in the cache, lmsensors does the same for this "
-                        "computer's own sensors (lm-sensors), and redfish provides only the inventory "
+                        "computer's own sensors (lm-sensors), and redfish, racadm and wsman provide only the inventory "
                         "(gui is an alias for web; default: web; "
                         "with --list, all sources)")
     p.add_argument("--metric", choices=METRIC_NAMES,
@@ -609,7 +610,7 @@ def parse_args():
                         "source and metric, with its source; or give a source (web, snmp) or a metric "
                         "(temperature, fan, power, voltage, health, network) to list only those; "
                         "inventory lists the hardware (CPUs, memory, disks, firmware ...) over snmp, or over redfish "
-                        "with --source redfish; "
+                        "with --source redfish, racadm or wsman; "
                         "--source and --metric also narrow the sensor listing")
     p.add_argument("--secure", action="store_true",
                    help="verify the TLS certificate (iDRACs are usually self-signed, so off by default)")
@@ -1006,8 +1007,15 @@ def lm_ssh_command(args):
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", "--", target, "sensors -j"]
 
 
-def ssh_connect(args):
-    """Return a connected paramiko client for args.host, reusing one from an earlier poll if it is still alive."""
+class SshUnreachable(SourceError):
+    """The ssh connection could not be made at all (as opposed to being refused)."""
+
+
+def ssh_connect(args, password=None):
+    """Return a connected paramiko client for args.host, reusing one from an earlier poll if it is still alive.
+
+    Login is by agent and key files, or by password when one is given (the iDRAC's own ssh shell takes passwords).
+    """
     import paramiko
     cfg = ssh_config_for(args.host)
     user = args.user or cfg.get("user") or getpass.getuser()
@@ -1021,13 +1029,15 @@ def ssh_connect(args):
     try:
         client.connect(
             hostname=cfg.get("hostname", args.host), port=int(cfg.get("port", 22)), username=user,
-            key_filename=[os.path.expanduser(f) for f in cfg.get("identityfile", [])] or None,
-            sock=paramiko.ProxyCommand(cfg["proxycommand"]) if cfg.get("proxycommand") else None,
-            allow_agent=True, look_for_keys=True, timeout=10, banner_timeout=10, auth_timeout=10)
+            key_filename=[os.path.expanduser(f) for f in cfg.get("identityfile", [])] or None if not password else None,
+            sock=paramiko.ProxyCommand(cfg["proxycommand"]) if cfg.get("proxycommand") else None, password=password,
+            allow_agent=not password, look_for_keys=not password, timeout=10, banner_timeout=10, auth_timeout=10)
     except paramiko.BadHostKeyException:
         raise SourceError(f"the ssh host key of {args.host} is different from the one in ~/.ssh/known_hosts: "
                           f"it may have been reinstalled, or this may be an attack; check it, then `ssh-keygen -R {args.host}`")
     except paramiko.AuthenticationException:
+        if password:
+            raise SourceError(f"ssh login to {user}@{args.host} failed: the user name or password was refused")
         raise SourceError(f"ssh login to {user}@{args.host} failed: no key or agent identity was accepted (ssh logs in with "
                           f"a key or the ssh agent, never a password: check that `ssh {user}@{args.host}` works without a prompt)")
     except paramiko.SSHException as e:
@@ -1036,7 +1046,7 @@ def ssh_connect(args):
                               f"on its own: run `ssh {user}@{args.host}` once and check the key it shows")
         raise SourceError(f"ssh to {args.host} failed: {e}")
     except (OSError, EOFError) as e:  # no route, refused, timed out, name not found
-        raise SourceError(f"could not connect to {args.host} over ssh: {e}")
+        raise SshUnreachable(f"could not connect to {args.host} over ssh: {e}")
     _SSH_CLIENTS[key] = client
     return client
 
@@ -1174,6 +1184,12 @@ SOURCES = {
     # Redfish provides the inventory only (see read_inventory_redfish), so it has no metrics
     "redfish": {"list": lambda args: redfish_list(args), "fetch": lambda args: redfish_fetch(args),
                 "accumulate": False, "metrics": ()},
+    # racadm, too, provides the inventory only (see read_inventory_racadm)
+    "racadm": {"list": lambda args: racadm_list(args), "fetch": lambda args: racadm_fetch(args),
+               "accumulate": False, "metrics": ()},
+    # and so does wsman (see read_inventory_wsman)
+    "wsman": {"list": lambda args: wsman_list(args), "fetch": lambda args: wsman_fetch(args),
+              "accumulate": False, "metrics": ()},
 }
 
 
@@ -1813,6 +1829,368 @@ def redfish_fetch(args):
     raise SourceError("the redfish source only provides the inventory: use --list inventory or --get inventory")
 
 
+# --- racadm: Dell's own command line for the iDRAC, used here for the inventory ---
+# The commands are run in the iDRAC's ssh shell (`racadm hwinventory` ...) with paramiko, so the password never shows in a
+# process list and one connection serves every command. If ssh cannot connect at all and a local `racadm` is installed,
+# `racadm -r HOST -u USER -p PASSWORD` is used instead (its password is visible in the process list while it runs).
+RACADM_STATUS = {"OK": "ok", "Warning": "non-critical", "Critical": "critical", "Unknown": "unknown"}
+RACADM_TIMEOUT = 180  # hwinventory takes about 30 s on an iDRAC8
+
+
+IDRAC_LOCK_WAIT = 600  # seconds to queue behind another ragdoll that is using racadm on the same iDRAC
+
+
+@contextlib.contextmanager
+def idrac_lock(args, wait=None):
+    """Let only one ragdoll at a time use an iDRAC's racadm or WS-Man logins; others queue behind it.
+
+    An iDRAC allows few ssh and racadm sessions and can lock an account out, so these are never run in parallel, by this
+    process or by another one (a cron job overlapping a manual run). The racadm and wsman sources share this lock. It is
+    a file in the cache directory, one per host, released when the process ends even if it crashes.
+    """
+    try:
+        import fcntl
+    except ImportError:  # not a POSIX system: no file locks, so only this process's own commands are serialised
+        yield
+        return
+    wait = IDRAC_LOCK_WAIT if wait is None else wait
+    path = args.cache_dir / (re.sub(r"[^\w.-]", "_", args.host) + ".idrac.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as lock:
+        deadline, told = time.monotonic() + wait, False
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise SourceError(f"another ragdoll has been using {args.host} for more than {wait:g} seconds "
+                                      f"(it holds {path}); try again when it has finished")
+                if not told and sys.stderr.isatty():
+                    print(f"Waiting for another ragdoll that is using {args.host}...", file=sys.stderr)
+                    told = True
+                time.sleep(1)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def racadm_local(args, subcommand):
+    """Run `racadm -r HOST ... SUBCOMMAND` with the racadm installed on this computer."""
+    command = ["racadm", "-r", args.host, "-u", args.user, "-p", args.password, "--nocertwarn", *subcommand.split()]
+    try:
+        run = subprocess.run(command, capture_output=True, text=True, timeout=RACADM_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise SourceError(f"racadm {subcommand} took too long")
+    return run.stdout + run.stderr
+
+
+def racadm_run(args, subcommand, tries=1):
+    """Return the output of `racadm SUBCOMMAND` on args.host, over ssh or, failing that, with the local racadm."""
+    resolve_credentials(args)
+    if not args.user or not args.password:
+        raise SourceError("the racadm source needs credentials: --user/--pass, $IDRAC_USER/$IDRAC_PASS, "
+                          "or ones saved with --save-credentials")
+    text = None
+    try:
+        import paramiko
+        for attempt in (1, 2):  # a connection kept from an earlier command may have dropped: reconnect once
+            client = ssh_connect(args, password=args.password)
+            try:
+                _, out, err = client.exec_command(f"racadm {subcommand}", timeout=RACADM_TIMEOUT)
+                text = out.read().decode(errors="replace") + err.read().decode(errors="replace")
+                break
+            except (paramiko.SSHException, EOFError, OSError) as e:
+                for known, other in list(_SSH_CLIENTS.items()):
+                    if other is client:
+                        del _SSH_CLIENTS[known]
+                client.close()
+                if attempt == 2:
+                    raise SourceError(f"racadm {subcommand} failed over ssh on {args.host}: {e}")
+    except (ImportError, SshUnreachable) as e:  # no paramiko, or ssh not reachable: try the racadm command
+        if not shutil.which("racadm"):
+            raise SourceError(f"cannot reach the iDRAC's ssh shell ({e}) and there is no local racadm to fall back on")
+        text = racadm_local(args, subcommand)
+    if re.match(r"\s*ERROR", text):
+        raise SourceError(text.strip().splitlines()[0])
+    if "No more sessions are available" in text:  # the iDRAC allows only a few racadm sessions at once: wait and retry
+        if tries >= 3:
+            raise SourceError("the iDRAC has no free racadm sessions (someone else is using them); try again in a moment")
+        time.sleep(5 * tries)
+        return racadm_run(args, subcommand, tries + 1)
+    return text
+
+
+def racadm_blocks(text):
+    """Split hwinventory or swinventory output into one dict per block of `Key = Value` lines."""
+    blocks = []
+    for raw in re.split(r"\n-{20,}[^\n]*\n", text):
+        pairs = {k.strip(): v.strip() for k, v in re.findall(r"^([^=\n\[]+?) = (.*)$", raw, re.M)}
+        if pairs:
+            blocks.append(pairs)
+    return blocks
+
+
+def _rstatus(value):
+    return RACADM_STATUS.get(value)
+
+
+def _rbytes(value):
+    """'959656755200 Bytes' -> '893.75 GiB'."""
+    m = re.match(r"(\d+)", value or "")
+    return _gib(1073741824)(int(m.group(1))) if m else None
+
+
+def _rmb(value):
+    """'32768 MB' -> '32 GiB'."""
+    m = re.match(r"(\d+)", value or "")
+    return _gib(1024)(int(m.group(1))) if m else None
+
+
+def _rmedia(value):
+    return {"Solid State Drive": "ssd", "Hard Disk Drive": "hdd"}.get(value, (value or "").lower() or None)
+
+
+def _rlayout(value):
+    return re.sub(r"^RAID(\d+)", r"RAID \1", value) if value else None
+
+
+# Device Type in hwinventory -> (category, how to name the item, {attribute: (key, how to show it)})
+RACADM_HW = {
+    "CPU": ("cpu", "FQDD", {"manufacturer": ("Manufacturer", None), "brand": ("Model", None),
+                            "cores": ("NumberOfProcessorCores", None), "enabled-cores": ("NumberOfEnabledCores", None),
+                            "threads": ("NumberOfEnabledThreads", None), "max-speed": ("MaxClockSpeed", None),
+                            "speed": ("CurrentClockSpeed", None), "status": ("PrimaryStatus", _rstatus)}),
+    "Memory": ("memory", "FQDD", {"size": ("Size", _rmb), "speed": ("Speed", None), "type": ("MemoryType", None),
+                                  "manufacturer": ("Manufacturer", None), "part-number": ("PartNumber", None),
+                                  "serial": ("SerialNumber", None), "status": ("PrimaryStatus", _rstatus)}),
+    "NIC": ("nic", "FQDD", {"product": ("ProductName", None), "vendor": ("VendorName", None),
+                            "mac": ("PermanentMACAddress", None), "speed": ("LinkSpeed", None)}),
+    "PCIDevice": ("pci", "FQDD", {"manufacturer": ("Manufacturer", None), "description": ("Description", None)}),
+    "Controller": ("controller", "FQDD", {"product": ("ProductName", None), "firmware": ("ControllerFirmwareVersion", None),
+                                          "cache": ("CacheSizeInMB", None), "status": ("PrimaryStatus", _rstatus)}),
+    "PCIeSSDExtender": ("controller", "FQDD", {"product": ("DeviceDescription", None),
+                                               "status": ("PrimaryStatus", _rstatus)}),
+    "PhysicalDisk": ("disk", "FQDD", {"manufacturer": ("Manufacturer", None), "model": ("Model", None),
+                                      "firmware": ("Revision", None), "size": ("SizeInBytes", _rbytes),
+                                      "bus": ("BusProtocol", lambda v: v.lower()), "media": ("MediaType", _rmedia),
+                                      "state": ("RaidStatus", lambda v: v.lower()), "status": ("PrimaryStatus", _rstatus)}),
+    "VirtualDisk": ("virtual-disk", "Name", {"size": ("SizeInBytes", _rbytes), "layout": ("RAIDTypes", _rlayout),
+                                             "media": ("MediaType", _rmedia), "state": ("RAIDStatus", lambda v: v.lower()),
+                                             "status": ("PrimaryStatus", _rstatus)}),
+    "ControllerBattery": ("raid-battery", "DeviceDescription", {"state": ("RAIDState", lambda v: v.lower()),
+                                                                 "status": ("PrimaryStatus", _rstatus)}),
+    "iDRACCard": ("idrac", None, {"firmware": ("FirmwareVersion", None), "edition": ("Model", None)}),
+}
+
+
+def read_inventory_racadm(args, only_category=None):
+    """Return the inventory (see read_inventory) from racadm; the categories match the SNMP and Redfish inventories."""
+    want = lambda *categories: only_category is None or only_category in categories
+    commands = []
+    if want("system", "bios"):
+        commands.append("getsysinfo -s")
+    if want("firmware"):
+        commands.append("swinventory")
+    if any(want(entry[0]) for entry in RACADM_HW.values()):
+        commands.append("hwinventory")
+    # one command at a time, over the one connection, and one ragdoll at a time per iDRAC: an iDRAC allows few ssh and
+    # racadm sessions and can lock an account out, so this is slower (each command takes 10 s or more on an iDRAC8)
+    # but safe
+    with idrac_lock(args):
+        output = {command: racadm_run(args, command) for command in commands}
+    records = []
+    if "getsysinfo -s" in output:
+        info = dict(re.findall(r"^([A-Za-z ]+?)\s+= (.*)$", output["getsysinfo -s"], re.M))
+        if want("system"):
+            records.append(("system", "system", _rf(("model", info.get("System Model")), ("name", info.get("Host Name")),
+                                                    ("service-tag", info.get("Service Tag")),
+                                                    ("power", (info.get("Power Status") or "").lower()))))
+        if want("bios"):
+            records.append(("bios", "bios", _rf(("version", info.get("System BIOS Version")))))
+    if "swinventory" in output:
+        for block in racadm_blocks(output["swinventory"]):
+            name = block.get("ElementName")
+            if "Current Version" in block and name != "BIOS":  # not rollback entries; the BIOS is the bios item
+                records.append(("firmware", name, _rf(("version", block["Current Version"]),
+                                                      ("installed", block.get("InstallationDate") if block.get("InstallationDate") != "NA" else None))))
+    for block in racadm_blocks(output.get("hwinventory", "")):
+        entry = RACADM_HW.get(block.get("Device Type"))
+        if not entry or not want(entry[0]):
+            continue
+        category, name_key, attributes = entry
+        details = _rf(*[(attr, (show(block[key]) if show else block[key]) if key in block else None)
+                        for attr, (key, show) in attributes.items()])
+        records.append((category, block.get(name_key) if name_key else category, details))
+    records = [r for r in records if r[2] and r[1]]
+    order = {category: i for i, (category, *_) in enumerate(INVENTORY)}
+    records.sort(key=lambda r: (order[r[0]], _natural(r[1])))
+    if not records:
+        what = f"{only_category} items" if only_category else "inventory"
+        raise SourceError(f"no {what} returned by racadm on {args.host}")
+    return records
+
+
+def racadm_list(args):
+    """For --save-credentials: logging in proves the credentials. The racadm source has no sensors to list."""
+    with idrac_lock(args):
+        racadm_run(args, "getconfig -g cfgRacTuning -o cfgRacTuneIpRangeEnable")  # a quick read-only command
+    return {}
+
+
+def racadm_fetch(args):
+    raise SourceError("the racadm source only provides the inventory: use --list inventory or --get inventory")
+
+
+# --- wsman: the inventory over WS-Man (HTTPS), with the python-dracclient module ---
+# No ssh and no racadm are needed. python-dracclient is OpenStack's iDRAC client; it covers part of the inventory. Its
+# transport is wrapped so that --secure is honoured (it hard-codes verify=False) and a hung iDRAC cannot hang ragdoll
+# (it sets no timeout). A refused login (HTTP 401) is raised at once and is never retried by the module.
+WSMAN_STATUS = {"ok": "ok", "warning": "non-critical", "critical": "critical", "unknown": "unknown"}
+WSMAN_TIMEOUT = 60
+
+
+class _WsmanRequests:
+    """Stands in for `requests` inside dracclient.wsman: its post() applies the real TLS setting and a timeout."""
+
+    def __init__(self, verify):
+        self.verify = verify
+
+    def post(self, *args, **kwargs):
+        kwargs["verify"] = self.verify
+        kwargs.setdefault("timeout", WSMAN_TIMEOUT)
+        return requests.post(*args, **kwargs)
+
+    def __getattr__(self, name):  # requests.auth, requests.exceptions ...
+        return getattr(requests, name)
+
+
+def wsman_client(args):
+    """A python-dracclient client for args.host, that makes one attempt at each request."""
+    resolve_credentials(args)
+    if not args.user or not args.password:
+        raise SourceError("the wsman source needs credentials: --user/--pass, $IDRAC_USER/$IDRAC_PASS, "
+                          "or ones saved with --save-credentials")
+    try:
+        import dracclient.wsman
+        from dracclient import client
+    except ImportError as e:
+        raise SourceError(f"python-dracclient is not installed ({e}); pip install python-dracclient six")
+    if not args.secure:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    dracclient.wsman.requests = _WsmanRequests(args.secure)
+    # ssl_retries=1 and ready_retries=1: one attempt each, so a problem is reported at once instead of being hammered
+    return client.DRACClient(args.host, args.user, args.password, ssl_retries=1, ssl_retry_delay=0,
+                             ready_retries=1, ready_retry_delay=1)
+
+
+class _LogCollector(logging.Handler):
+    """Keeps what python-dracclient logs: its exceptions carry no detail, only its log messages say what went wrong."""
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def _wsman_call(args, call):
+    """Run one python-dracclient call, turning its exceptions into SourceError."""
+    from dracclient import exceptions
+    collector, logger = _LogCollector(), logging.getLogger("dracclient.wsman")
+    logger.addHandler(collector)  # also stops the module's own messages going to the terminal
+    try:
+        return call()
+    except exceptions.WSManInvalidResponse as e:
+        if "401" in str(e):
+            raise SourceError(f"WS-Man login to {args.host} failed: the user name or password was refused")
+        raise SourceError(f"WS-Man request to {args.host} failed: {e}")
+    except exceptions.BaseClientException as e:
+        why = collector.messages[-1] if collector.messages else str(e)
+        if "SSLError" in why and args.secure:
+            why += " (its certificate could not be verified; an iDRAC usually has a self-signed one, so leave --secure off)"
+        raise SourceError(f"WS-Man request to {args.host} failed: {why}")
+    finally:
+        logger.removeHandler(collector)
+
+
+def _wstatus(value):
+    return WSMAN_STATUS.get(str(value).lower()) if value else None
+
+
+def read_inventory_wsman(args, only_category=None):
+    """Return the inventory (see read_inventory) over WS-Man. It has no BIOS, iDRAC, firmware (only the Lifecycle
+    Controller), RAID battery or PCI devices other than video; the other categories match the rest."""
+    want = lambda category: only_category in (None, category)
+    records = []
+    with idrac_lock(args):
+        client = wsman_client(args)
+        call = lambda f, *a: _wsman_call(args, lambda: f(*a))
+        if want("system"):
+            system = call(client.get_system)
+            power = str(call(client.get_power_state) or "").replace("POWER_", "").lower()
+            records.append(("system", "system", _rf(("model", system.model), ("service-tag", system.service_tag),
+                                                    ("power", power))))
+        if want("firmware"):
+            version = ".".join(str(n) for n in call(client.get_lifecycle_controller_version))
+            records.append(("firmware", "Lifecycle Controller", _rf(("version", version))))
+        if want("cpu"):
+            for cpu in call(client.list_cpus):
+                records.append(("cpu", cpu.id, _rf(("brand", cpu.model), ("cores", cpu.cores), ("threads", cpu.cpu_count),
+                                                   ("speed", _rf_mhz(cpu.speed_mhz)), ("status", _wstatus(cpu.status)))))
+        if want("memory"):
+            for dimm in call(client.list_memory):
+                records.append(("memory", dimm.id, _rf(("size", _rf_gib(dimm.size_mb, 1024)), ("speed", _rf_mhz(dimm.speed_mhz)),
+                                                       ("type", dimm.model), ("manufacturer", dimm.manufacturer),
+                                                       ("status", _wstatus(dimm.status)))))
+        if want("nic"):
+            for nic in call(client.list_nics):
+                records.append(("nic", nic.id, _rf(("product", nic.model), ("mac", nic.mac),
+                                                   ("speed", f"{nic.speed_mbps} Mb/s" if nic.speed_mbps else None),
+                                                   ("duplex", nic.duplex))))
+        if want("pci"):  # python-dracclient lists video controllers only, not all PCI devices
+            for video in call(client.list_video_controllers):
+                records.append(("pci", video.id, _rf(("description", video.description), ("manufacturer", video.manufacturer))))
+        if want("controller"):
+            for ctrl in call(client.list_raid_controllers):
+                records.append(("controller", ctrl.id, _rf(("product", ctrl.model), ("manufacturer", ctrl.manufacturer),
+                                                           ("firmware", ctrl.firmware_version), ("status", _wstatus(ctrl.primary_status)))))
+        if want("disk"):
+            for disk in call(client.list_physical_disks):
+                records.append(("disk", disk.id, _rf(("manufacturer", disk.manufacturer), ("model", disk.model),
+                                                     ("serial", disk.serial_number), ("firmware", disk.firmware_version),
+                                                     ("size", _rf_gib(disk.size_mb, 1024)), ("bus", disk.interface_type),
+                                                     ("media", disk.media_type), ("state", disk.raid_status),
+                                                     ("status", _wstatus(disk.status)))))
+        if want("virtual-disk"):
+            for vd in call(client.list_virtual_disks):
+                level = str(vd.raid_level or "")
+                records.append(("virtual-disk", vd.name, _rf(("size", _rf_gib(vd.size_mb, 1024)),
+                                                             ("layout", f"RAID {level}" if level.isdigit() else level),
+                                                             ("state", vd.raid_status), ("status", _wstatus(vd.status)))))
+    records = [r for r in records if r[2] and r[1]]
+    order = {category: i for i, (category, *_) in enumerate(INVENTORY)}
+    records.sort(key=lambda r: (order[r[0]], _natural(r[1])))
+    if not records:
+        what = f"{only_category} items" if only_category else "inventory"
+        raise SourceError(f"no {what} returned by WS-Man on {args.host}")
+    return records
+
+
+def wsman_list(args):
+    """For --save-credentials: one cheap request proves the login. The wsman source has no sensors to list."""
+    with idrac_lock(args):
+        client = wsman_client(args)
+        _wsman_call(args, client.get_lifecycle_controller_version)
+    return {}
+
+
+def wsman_fetch(args):
+    raise SourceError("the wsman source only provides the inventory: use --list inventory or --get inventory")
+
+
 INVENTORY_HEADER = ("CATEGORY", "NAME", "DETAILS")
 
 
@@ -1894,11 +2272,19 @@ def list_inventory(args):
     sub = copy.copy(args)
     # snmp is the default; redfish (and web, the iDRAC's web interface, which is where Redfish lives) use Redfish
     sub.source = args.source or "snmp"
-    if sub.source not in ("snmp", "redfish", "web"):
-        sys.exit(f"the inventory needs --source snmp or redfish, not {sub.source}")
+    if sub.source not in ("snmp", "redfish", "web", "racadm", "wsman"):
+        sys.exit(f"the inventory needs --source snmp, redfish, racadm or wsman, not {sub.source}")
     try:
         if sub.source == "snmp":
             records = asyncio.run(read_inventory(sub, args.category))
+        elif sub.source == "wsman":
+            if sys.stderr.isatty():
+                print("Reading the inventory over WS-Man: about 30 seconds on an iDRAC8...", file=sys.stderr)
+            records = read_inventory_wsman(sub, args.category)
+        elif sub.source == "racadm":
+            if sys.stderr.isatty():
+                print("Reading the inventory with racadm: about a minute for all of it on an iDRAC8...", file=sys.stderr)
+            records = read_inventory_racadm(sub, args.category)
         else:
             if sys.stderr.isatty():
                 print("Reading the inventory over Redfish: about 10 seconds to log in, then 2 to 30 more on an iDRAC8...",
@@ -1922,8 +2308,8 @@ def list_inventory(args):
 
 
 def list_all(args):
-    if args.source == "redfish" and args.list != "inventory":
-        sys.exit("the redfish source has no sensors, only the inventory: use --list inventory or --get inventory")
+    if args.source and not SOURCES[args.source]["metrics"] and args.list != "inventory":
+        sys.exit(f"the {args.source} source has no sensors, only the inventory: use --list inventory or --get inventory")
     """List every matching sensor in the chosen --output format (text by default); return an exit code."""
     if args.list == "inventory":
         return list_inventory(args)

@@ -8,10 +8,69 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.4.6 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.4.9 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+## [0.4.9] - 2026-10-06
+
+### Added
+- `--source wsman` reads the hardware inventory over WS-Man with the `python-dracclient` module (`--list inventory`,
+  `--get inventory`), needing neither ssh nor racadm. It covers `system`, `cpu`, `memory`, `nic`, `controller`, `disk` and
+  `virtual-disk` like the other sources, `pci` for the video controller only and `firmware` for the Lifecycle Controller
+  only, and has no `bios`, `idrac` or `raid-battery`. All the inventory options (`--category`, `--name`, `--detail`,
+  `--field`, every `--output`) work with it. 40 items in 31 s on the test iDRAC, and 2 to 6 s for one category.
+- It uses the web credentials. A refused login (HTTP 401) is reported after one attempt, in under a second.
+- python-dracclient hard-codes `verify=False` and sets no request timeout, so its transport is wrapped: `--secure` is
+  honoured and a request times out after 60 s. Its retries are set to one attempt (`ssl_retries=1`, `ready_retries=1`).
+  Its exceptions carry no detail, so ragdoll reads the module's log message to say what failed (TLS, connection).
+- `python-dracclient` and `six` in `requirements.txt` (the module imports `six` without declaring it).
+- The `wsman` source has no metrics, like `racadm` and `redfish`.
+
+### Changed
+- The per-iDRAC lock is now shared by the racadm and wsman sources, so a run of one waits for a run of the other (a racadm
+  run and a wsman run started together finished at 12 s and 15 s). The lock file is `<host>.idrac.lock` (it was
+  `<host>.racadm.lock`; the old file is harmless and can be deleted).
+
+### Changed
+- The README now says plainly that the racadm source needs no `racadm` installed on this computer, because the commands
+  run in the iDRAC's own ssh shell. I checked it by removing `racadm` from the search path: the source still worked.
+
+## [0.4.8] - 2026-10-06
+
+### Changed
+- racadm commands now run strictly one at a time over one ssh login, so an iDRAC is never given parallel sessions. The
+  whole inventory takes 41 s, the same as the 40 s with two at once, because the iDRAC runs them one at a time anyway.
+- Only one ragdoll process at a time talks racadm to a given iDRAC: a per-host lock file (`<host>.racadm.lock`) in the
+  cache directory makes a second process wait for the first, and give up with a message after ten minutes. The lock is
+  released by the operating system if the holder crashes (checked with `kill -9`). Two simultaneous runs finished at
+  8 s and 20 s, so they queued and did not overlap. Another iDRAC has its own lock.
+- If the iDRAC reports "No more sessions are available" (someone else is using them), ragdoll waits 5 s, then 10 s, and
+  tries again, giving up after three attempts (it was five attempts at 3 s steps).
+- A refused login is still reported at once and never retried, so a wrong password costs one attempt per run.
+
+## [0.4.7] - 2026-10-06
+
+### Added
+- `--source racadm` reads the hardware inventory with Dell's `racadm` (`--list inventory`, `--get inventory`), with the
+  same categories, `--category`, `--name`, `--detail`, `--field` and `--output` options as the other inventory sources.
+  It uses the web credentials.
+- It runs `racadm getsysinfo -s` (system, BIOS), `racadm swinventory` (firmware) and `racadm hwinventory` (everything
+  else) in the iDRAC's ssh shell with paramiko, so the password stays inside the ssh connection. Host keys are checked
+  strictly, and `known_hosts` is never written.
+- If ssh to the iDRAC cannot be reached, or paramiko is missing, and `racadm` is installed locally, it runs
+  `racadm -r HOST -u USER -p PASSWORD --nocertwarn ...` instead (the password is then visible in the process list while
+  it runs). A refused login is not retried that way.
+- Two commands run at a time, because the iDRAC refuses a third racadm session ("No more sessions are available"); that
+  message is also retried with a short wait. The whole inventory took 40 s on the test iDRAC, a system or BIOS lookup 11 s.
+- On the test iDRAC racadm gave all 12 categories (80 items): 15 firmware items, 4 controllers, 23 PCI devices, 10 disks
+  and RAID layouts such as `RAID 5` exactly.
+- The `racadm` source has no metrics: a chart, a sensor listing, `--get` of a sensor and `--tail` are rejected with a
+  message pointing to the inventory.
+
+### Changed
+- The ssh connection helper can log in with a password (for the iDRAC's own ssh shell) as well as with keys and the agent.
 
 ## [0.4.6] - 2026-10-06
 

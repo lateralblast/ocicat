@@ -24,7 +24,7 @@ is running on, through lm-sensors.
 pip install -r requirements.txt
 ```
 
-This installs `requests` (web source), `pysnmp` (snmp source), `paramiko` (ssh, for `--source lmsensors --host`), `keyring` (saved credentials), `terminaltables` (table
+This installs `requests` (web source), `pysnmp` (snmp source), `paramiko` (ssh, for `--source lmsensors --host` and `--source racadm`), `python-dracclient` and `six` (`--source wsman`; python-dracclient imports `six` without listing it), `keyring` (saved credentials), `terminaltables` (table
 output), `XlsxWriter` and `xlwt` (`.xlsx` and `.xls` output), and the two graphing modules, `plotext` and `termgraph`.
 `plotext` is pinned to 5.3.2 because 6.x has a different API.
 
@@ -51,12 +51,14 @@ Credentials do not have to be typed each time: see [Credentials](#credentials).
 
 ## Sources and metrics
 
-ragdoll reads from four sources, chosen with `--source` (`gui` is accepted as another name for `web`):
+ragdoll reads from six sources, chosen with `--source` (`gui` is accepted as another name for `web`):
 
 | Source | Metrics | How it works | History |
 |---|---|---|---|
 | `web` (default; also `gui`) | temperature | Logs in to the iDRAC web interface and downloads the temperature statistics CSV | Hourly history held by the iDRAC |
 | `lmsensors` | temperature, fan, power, voltage | Reads the sensors of the computer ragdoll runs on, through `sensors -j` from lm-sensors. No `--host` or login needed | Only the current value; each run appends a reading to the local cache, as with snmp |
+| `wsman` | none: the [hardware inventory](#hardware-inventory) only | Reads part of the inventory over WS-Man (HTTPS) with the `python-dracclient` module: no ssh and no racadm | The inventory is a snapshot, so there is no history |
+| `racadm` | none: the [hardware inventory](#hardware-inventory) only | Runs Dell's `racadm` commands (`hwinventory`, `swinventory`, `getsysinfo`) in the iDRAC's ssh shell | The inventory is a snapshot, so there is no history |
 | `redfish` | none: the [hardware inventory](#hardware-inventory) only | Reads the inventory from the iDRAC's Redfish API over HTTPS | The inventory is a snapshot, so there is no history |
 | `snmp` | temperature, fan, power, voltage, health, network | Reads the current value from the Dell probe tables (and the standard interface counters) over SNMP v2c | Only the current value; each run appends a reading to the local cache, so history builds up over time |
 
@@ -241,6 +243,66 @@ describe the hardware a little differently:
 
 The names of the memory modules (`DIMM.Socket.A1`), network ports, processors, disks and virtual disks are the same in
 both, so the same `--name` works with either source.
+
+**Over racadm.** `--source racadm` gets the same inventory from Dell's `racadm` commands, which on an iDRAC8 is the
+most complete source: every category, with exact RAID layouts (`RAID 5`, not `RAID 5 or RAID 6`), all 15 installed
+firmware items and the four storage controllers.
+
+```
+python3 ragdoll.py --host 192.0.2.20 --source racadm --get inventory --category memory --name DIMM.Socket.A1
+```
+```
+CATEGORY  NAME            DETAILS
+memory    DIMM.Socket.A1  size=32 GiB; speed=2133 MHz; type=DDR-4; manufacturer=Samsung; part-number=M386A4G40DM0-CPB; serial=XXXXXXXX; status=ok
+```
+
+- **No racadm needed on this computer.** The commands run on the iDRAC itself, in its ssh shell, so a computer without
+  Dell's `racadm` installed works as well (tested with `racadm` removed from the search path). There is no Python module that
+  wraps racadm: the one called `racadm` on PyPI is an empty placeholder.
+- **How it connects:** ragdoll logs in to the iDRAC's own ssh shell with paramiko, using the web credentials (`--user` and
+  `--pass`, the keyring or the environment), and runs `racadm getsysinfo -s`, `racadm swinventory` and
+  `racadm hwinventory` there. The password is sent over the ssh connection, so it never appears in a process list, and
+  the iDRAC's host key is checked against `~/.ssh/known_hosts` like any other (ssh to the iDRAC once first). The iDRAC's
+  ssh service must be enabled, which it is by default.
+- **Fallback:** if ssh to the iDRAC cannot be reached at all (or paramiko is not installed) and `racadm` is installed on
+  this computer, ragdoll runs `racadm -r <host> -u <user> -p <password> --nocertwarn ...` instead. That works, but the
+  password is then visible to other users in the process list while it runs. A refused login is not retried this way.
+- **Never in parallel:** an iDRAC allows few ssh and racadm sessions and can lock an account out, so ragdoll runs one
+  command at a time over a single ssh login, and never two ragdoll processes at once on the same iDRAC. A second ragdoll
+  (a cron job overlapping a manual run, say) waits for the first, using a lock file per host in the cache directory
+  (`<host>.idrac.lock`, shared with the `wsman` source), and carries on when it finishes; it gives up with a message after ten minutes. The lock is
+  released if the first process crashes. One login is made per run, and a refused login is never retried. If the
+  iDRAC says it has no free racadm sessions (someone else is using them), ragdoll waits a few seconds and tries again,
+  twice at most.
+- **Speed:** each command takes 10 seconds or more on an iDRAC8, and `hwinventory` about 25, so the whole inventory takes
+  about 40 seconds and `--category system` or `--category bios` about 11. A category such as `memory` needs the full
+  `hwinventory`, about 25 seconds. Running the commands in parallel would not be faster on the test iDRAC (40 seconds
+  either way), so nothing is lost by running them one after another.
+- **Names** match the other sources for memory modules (`DIMM.Socket.A1`), network ports, processors and PCI devices
+  (23, as with SNMP). Disks are named by their full location (`Disk.Bay.0:Enclosure.Internal.0-1:RAID.Integrated.1-1`)
+  and controllers by their location (`RAID.Integrated.1-1`), and the firmware items include the network adapters, whose
+  names contain their MAC addresses.
+- It provides the inventory only, like `redfish`: `--source racadm` with a chart, `--list` of sensors, `--get` of a
+  sensor or `--tail` is rejected with a message pointing to the inventory.
+
+**Over WS-Man.** `--source wsman` reads the inventory over WS-Man (the SOAP-over-HTTPS interface that the iDRAC's own
+tools use) with the `python-dracclient` module, so it needs neither ssh nor racadm. It is the quickest of the inventory
+sources, and one category takes only a few seconds, but it covers less.
+
+```
+python3 ragdoll.py --host 192.0.2.20 --source wsman --get inventory --category cpu
+```
+
+- **Coverage:** `system` (model, service tag, power state), `cpu`, `memory`, `nic`, `controller`, `disk` and `virtual-disk`
+  match the other sources. `pci` has only the video controller, and `firmware` has only the Lifecycle Controller version. There
+  is no `bios`, `idrac` or `raid-battery`, because the module does not return them. Use `snmp`, `redfish` or `racadm` for those.
+- **Speed:** 31 seconds for everything on the test iDRAC, and 2 to 6 seconds for one category.
+- **Credentials:** the web credentials. A refused login stops after one attempt. Requests are made one at a time, under the
+  same per-iDRAC lock as racadm.
+- **TLS:** the module hard-codes "do not verify certificates" and has no timeout. ragdoll replaces both, so `--secure` works
+  (it fails on a self-signed certificate, as you would expect) and a request is given up after 60 seconds.
+- **Install:** `pip install python-dracclient six`. The module imports `six` without declaring it, so it must be installed
+  as well. Without the module the source says so and how to install it.
 
 **Redfish is slow on an iDRAC8.** With a password, every request takes 5 to 9 seconds, because the iDRAC checks it
 each time. ragdoll therefore logs in once with a session token (about 10 seconds), after which each request takes under
@@ -759,7 +821,7 @@ A systemd service or a terminal multiplexer is a good place to run it. For one r
 | Option | What it does |
 |---|---|
 | `--host HOST` | the iDRAC's address (required, except with `--source lmsensors`: without it this computer is read, with it that computer over ssh) |
-| `--source web\|snmp\|redfish\|lmsensors` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get`, `--tail` and for the inventory. `redfish` (and `web`) read the inventory over Redfish; `lmsensors` reads this computer |
+| `--source web\|snmp\|redfish\|racadm\|wsman\|lmsensors` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get`, `--tail` and for the inventory. `redfish` (and `web`) read the inventory over Redfish, `racadm` with racadm, `wsman` over WS-Man; `lmsensors` reads this computer |
 | `--metric M` | `temperature`, `fan`, `power`, `voltage`, `health` or `network`; default `temperature` |
 | `--sensor S` | which sensor of the metric; the default depends on the metric |
 | `--list [sensors\|inventory\|SOURCE\|METRIC]` | list the sensors, or the hardware inventory, and exit |
@@ -937,7 +999,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
 
 ## Version
 
-Current version: **0.4.6**. Print it with `python3 ragdoll.py --version`.
+Current version: **0.4.9**. Print it with `python3 ragdoll.py --version`.
 
 Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
