@@ -8,10 +8,27 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.4.0 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.4.1 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+## [0.4.1] - 2026-10-06
+
+### Added
+- `--source redfish` reads the hardware inventory over the iDRAC's Redfish API, for `--list inventory` and
+  `--get inventory`, with the same categories, `--category`, `--name`, `--detail`, `--field` and `--output` options as
+  the SNMP inventory. `--source web` (and `gui`) read the inventory over Redfish too. SNMP stays the default.
+- It uses the web credentials (`--user`/`--pass`, the keyring or the environment), which the web and redfish sources
+  share.
+- Redfish gives more firmware (11 installed items against 2), the storage controllers (4 against 2) and drive and
+  volume details, but only 12 PCI devices (against 23), no RAID battery, and `RAID 5 or RAID 6` where SNMP says
+  `RAID 5`. Names of memory modules, network ports, CPUs, disks and virtual disks match SNMP's.
+- A Redfish login uses a session token, made once per run and logged out afterwards (no sessions are left behind,
+  checked against the iDRAC's session list), because every request with a password takes 5 to 9 seconds on an iDRAC8
+  and about 0.5 s with a token. A full inventory takes about 43 seconds (10 of them logging in); one category about 12.
+- The `redfish` source has no metrics: `--source redfish` with a chart, `--list` of sensors or `--get` of a sensor is
+  rejected with a message pointing to the inventory.
 
 ## [0.4.0] - 2026-10-06
 

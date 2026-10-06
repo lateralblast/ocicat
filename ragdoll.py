@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import calendar
 import collections
+import concurrent.futures
 import contextlib
 import fnmatch
 import copy
@@ -33,7 +34,7 @@ from pathlib import Path
 import requests
 import urllib3
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 
 class SourceError(Exception):
@@ -569,7 +570,8 @@ def parse_args():
                    help="delete this host's credentials from the OS keyring and exit")
     p.add_argument("--source", choices=sorted(SOURCES), type=lambda v: SOURCE_ALIASES.get(v.lower(), v.lower()),
                    help="where sensor data comes from: web is the iDRAC web interface (history), "
-                        "snmp reads the current value and builds history in the cache (gui is an alias for web; default: web; "
+                        "snmp reads the current value and builds history in the cache, and redfish provides only the inventory "
+                        "(gui is an alias for web; default: web; "
                         "with --list, all sources)")
     p.add_argument("--metric", choices=METRIC_NAMES,
                    help="what to read: temperature, fan (RPM), power (W, A, Wh), voltage (V), health (status "
@@ -599,7 +601,8 @@ def parse_args():
                    help="list the available sensors and exit: sensors (the default) lists every sensor of every "
                         "source and metric, with its source; or give a source (web, snmp) or a metric "
                         "(temperature, fan, power, voltage, health, network) to list only those; "
-                        "inventory lists the hardware (CPUs, memory, disks, firmware ...) over snmp; "
+                        "inventory lists the hardware (CPUs, memory, disks, firmware ...) over snmp, or over redfish "
+                        "with --source redfish; "
                         "--source and --metric also narrow the sensor listing")
     p.add_argument("--secure", action="store_true",
                    help="verify the TLS certificate (iDRACs are usually self-signed, so off by default)")
@@ -937,6 +940,9 @@ SOURCE_ALIASES = {"gui": "web"}  # alternative names accepted for --source and -
 SOURCES = {
     "web": {"list": web_list, "fetch": web_fetch, "accumulate": False, "metrics": ("temperature",)},
     "snmp": {"list": snmp_list, "fetch": snmp_fetch, "accumulate": True, "metrics": METRIC_NAMES},
+    # Redfish provides the inventory only (see read_inventory_redfish), so it has no metrics
+    "redfish": {"list": lambda args: redfish_list(args), "fetch": lambda args: redfish_fetch(args),
+                "accumulate": False, "metrics": ()},
 }
 
 
@@ -1367,6 +1373,173 @@ def list_xls(args, records):
 LIST_OUTPUTS = {"text": list_text, "table": list_table, "csv": list_csv, "xlsx": list_xlsx, "xls": list_xls}
 
 
+# --- Redfish: the same inventory over the iDRAC's Redfish API ---
+# Every request takes 5-9 s with basic authentication on an iDRAC8 (it checks the password each time), but only
+# 0.3-0.9 s with a session token, so one session is made per run (about 10 s) and used for all requests.
+REDFISH_HEALTH = {"OK": "ok", "Warning": "non-critical", "Critical": "critical"}
+REDFISH_VOLUME_TYPES = {"NonRedundant": "RAID 0", "Mirrored": "RAID 1", "StripedWithParity": "RAID 5 or RAID 6",
+                        "SpannedMirrors": "RAID 10", "SpannedStripesWithParity": "RAID 50 or RAID 60",
+                        "RawDevice": "raw device"}
+
+
+@contextlib.contextmanager
+def redfish_session(args):
+    """Log in to Redfish with a session token and yield get(path) -> parsed JSON; log out afterwards."""
+    resolve_credentials(args)
+    if not args.user or not args.password:
+        raise SourceError("the redfish source needs credentials: --user/--pass, $IDRAC_USER/$IDRAC_PASS, "
+                          "or ones saved with --save-credentials")
+    if not args.secure:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    base = f"https://{args.host}"
+    session = requests.Session()
+    session.verify = args.secure
+    try:
+        # the iDRAC8 answers this POST with 405 although the session is created, so the token is what counts
+        reply = session.post(f"{base}/redfish/v1/SessionService/Sessions",
+                             json={"UserName": args.user, "Password": args.password}, timeout=60)
+    except requests.RequestException as e:
+        raise SourceError(f"could not log in to Redfish: {e}")
+    token, location = reply.headers.get("X-Auth-Token"), reply.headers.get("Location")
+    if not token:
+        raise SourceError("Redfish login failed (check --user/--pass)")
+    session.headers["X-Auth-Token"] = token
+
+    def get(path):
+        try:
+            resp = session.get(base + path, timeout=60)
+        except requests.RequestException as e:
+            raise SourceError(f"Redfish request for {path} failed: {e}")
+        if resp.status_code != 200:
+            raise SourceError(f"Redfish request for {path} returned {resp.status_code}")
+        return resp.json()
+
+    try:
+        yield get
+    finally:
+        if location:
+            try:
+                session.delete(location if location.startswith("http") else base + location, timeout=30)
+            except requests.RequestException:
+                pass
+
+
+def _members(get, collection):
+    """The paths of the members of a Redfish collection given as a link or a path."""
+    path = collection["@odata.id"] if isinstance(collection, dict) else collection
+    return [m["@odata.id"] for m in get(path).get("Members", [])]
+
+
+def _health(resource):
+    return REDFISH_HEALTH.get((resource.get("Status") or {}).get("Health") or "")
+
+
+def _rf(*pairs):
+    """Build a details list from (attribute, value) pairs, leaving out the ones with no value."""
+    return [(a, str(v)) for a, v in pairs if v not in (None, "")]
+
+
+def _rf_gib(value, per_gib):
+    return _gib(per_gib)(value) if value else None
+
+
+def _rf_mhz(value):
+    return f"{int(value)} MHz" if value else None
+
+
+def read_inventory_redfish(args, only_category=None):
+    """Return the inventory (see read_inventory) over Redfish; the categories match the SNMP inventory."""
+    want = lambda category: only_category in (None, category)
+    records = []
+    with redfish_session(args) as get, concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        def fetch(paths):
+            return list(pool.map(get, paths))
+
+        system_path = _members(get, "/redfish/v1/Systems")[0]
+        system = get(system_path)
+        if want("system"):
+            records.append(("system", "system", _rf(
+                ("model", system.get("Model")), ("name", system.get("HostName")), ("service-tag", system.get("SKU")),
+                ("manufacturer", system.get("Manufacturer")), ("power", str(system.get("PowerState") or "").lower()),
+                ("status", _health(system)))))
+        if want("idrac"):
+            manager = get(_members(get, "/redfish/v1/Managers")[0])
+            records.append(("idrac", "idrac", _rf(("product", manager.get("Model")),
+                                                  ("firmware", manager.get("FirmwareVersion")),
+                                                  ("status", _health(manager)))))
+        if want("bios"):
+            records.append(("bios", "bios", _rf(("version", system.get("BiosVersion")))))
+        if want("firmware"):
+            installed = [p for p in _members(get, "/redfish/v1/UpdateService/FirmwareInventory") if "/Installed-" in p]
+            for item in fetch(installed):
+                if item.get("Name") == "BIOS":  # already shown as the bios item, and would match --name bios twice
+                    continue
+                records.append(("firmware", item.get("Name") or item.get("Id"),
+                                _rf(("version", item.get("Version")), ("status", _health(item)))))
+        if want("cpu"):
+            for cpu in fetch(_members(get, system["Processors"])):
+                records.append(("cpu", cpu.get("Id"), _rf(
+                    ("manufacturer", cpu.get("Manufacturer")), ("brand", cpu.get("Model")), ("cores", cpu.get("TotalCores")),
+                    ("threads", cpu.get("TotalThreads")), ("max-speed", _rf_mhz(cpu.get("MaxSpeedMHz"))),
+                    ("status", _health(cpu)))))
+        if want("memory"):
+            for dimm in fetch(_members(get, system["Memory"])):
+                slot = re.match(r"DIMM\s+([A-Z]\d+)", dimm.get("DeviceLocator") or "")
+                records.append(("memory", f"DIMM.Socket.{slot.group(1)}" if slot else dimm.get("Name"), _rf(
+                    ("size", _rf_gib(dimm.get("CapacityMiB"), 1024)), ("speed", _rf_mhz(dimm.get("OperatingSpeedMhz"))),
+                    ("type", dimm.get("MemoryDeviceType")), ("manufacturer", dimm.get("Manufacturer")),
+                    ("part-number", dimm.get("PartNumber")), ("serial", dimm.get("SerialNumber")),
+                    ("status", _health(dimm)))))
+        if want("nic"):
+            for nic in fetch(_members(get, system["EthernetInterfaces"])):
+                records.append(("nic", nic.get("Id"), _rf(
+                    ("description", nic.get("Description")), ("mac", nic.get("MACAddress")),
+                    ("speed", f"{nic['SpeedMbps']} Mb/s" if nic.get("SpeedMbps") else None), ("status", _health(nic)))))
+        if want("pci"):
+            for device in fetch([d["@odata.id"] for d in system.get("PCIeDevices", [])]):
+                records.append(("pci", device.get("Id"), _rf(
+                    ("description", device.get("Name")), ("manufacturer", device.get("Manufacturer")),
+                    ("status", _health(device)))))
+        if any(want(c) for c in ("controller", "disk", "virtual-disk")):
+            for storage in fetch(_members(get, system["Storage"])):
+                controller = (storage.get("StorageControllers") or [{}])[0]
+                if want("controller"):
+                    records.append(("controller", controller.get("Name") or storage.get("Name"), _rf(
+                        ("firmware", controller.get("FirmwareVersion")), ("manufacturer", controller.get("Manufacturer")),
+                        ("status", _health(storage)))))
+                if want("disk"):
+                    for disk in fetch([d["@odata.id"] for d in storage.get("Drives", [])]):
+                        records.append(("disk", disk.get("Name"), _rf(
+                            ("manufacturer", disk.get("Manufacturer")), ("model", disk.get("Model")),
+                            ("serial", disk.get("SerialNumber")), ("firmware", disk.get("Revision")),
+                            ("size", _rf_gib(disk.get("CapacityBytes"), 1073741824)),
+                            ("bus", str(disk.get("Protocol") or "").lower()), ("media", str(disk.get("MediaType") or "").lower()),
+                            ("status", _health(disk)))))
+                if want("virtual-disk") and storage.get("Volumes"):
+                    for volume in fetch(_members(get, storage["Volumes"])):
+                        records.append(("virtual-disk", volume.get("Name"), _rf(
+                            ("size", _rf_gib(volume.get("CapacityBytes"), 1073741824)),
+                            ("layout", REDFISH_VOLUME_TYPES.get(volume.get("VolumeType"), volume.get("VolumeType"))),
+                            ("status", _health(volume)))))
+    records = [r for r in records if r[2] and r[1]]
+    order = {category: i for i, (category, *_) in enumerate(INVENTORY)}
+    records.sort(key=lambda r: (order[r[0]], _natural(r[1])))
+    if not records:
+        what = f"{only_category} items" if only_category else "inventory"
+        raise SourceError(f"no {what} returned by {args.host} over Redfish")
+    return records
+
+
+def redfish_list(args):
+    """For --save-credentials: logging in proves the credentials. The redfish source has no sensors to list."""
+    with redfish_session(args):
+        return {}
+
+
+def redfish_fetch(args):
+    raise SourceError("the redfish source only provides the inventory: use --list inventory or --get inventory")
+
+
 INVENTORY_HEADER = ("CATEGORY", "NAME", "DETAILS")
 
 
@@ -1436,14 +1609,19 @@ INVENTORY_OUTPUTS = {"text": inventory_text, "table": inventory_table, "csv": in
 
 def list_inventory(args):
     """List the hardware inventory over SNMP in the chosen --output format (--list inventory or --get inventory)."""
-    if args.source not in (None, "snmp"):
-        sys.exit(f"the inventory needs --source snmp: the {args.source} source has none")
     if args.metric or args.sensor:
         sys.exit("--metric and --sensor do not apply to the inventory")
     sub = copy.copy(args)
-    sub.source = "snmp"
+    # snmp is the default; redfish (and web, the iDRAC's web interface, which is where Redfish lives) use Redfish
+    sub.source = args.source or "snmp"
     try:
-        records = asyncio.run(read_inventory(sub, args.category))
+        if sub.source == "snmp":
+            records = asyncio.run(read_inventory(sub, args.category))
+        else:
+            if sys.stderr.isatty():
+                print("Reading the inventory over Redfish: about 10 seconds to log in, then 2 to 30 more on an iDRAC8...",
+                      file=sys.stderr)
+            records = read_inventory_redfish(sub, args.category)
     except SourceError as e:
         sys.exit(f"Failed to read the inventory of {args.host}: {e}")
     if args.name:
@@ -1462,6 +1640,8 @@ def list_inventory(args):
 
 
 def list_all(args):
+    if args.source == "redfish" and args.list != "inventory":
+        sys.exit("the redfish source has no sensors, only the inventory: use --list inventory or --get inventory")
     """List every matching sensor in the chosen --output format (text by default); return an exit code."""
     if args.list == "inventory":
         return list_inventory(args)
@@ -1578,6 +1758,8 @@ def main():
         sys.exit(get_value(args))
     args.source = args.source or "web"
     args.metric = args.metric or "temperature"
+    if not SOURCES[args.source]["metrics"]:
+        sys.exit(f"the {args.source} source only provides the inventory: use --list inventory or --get inventory")
     if args.metric not in SOURCES[args.source]["metrics"]:
         sys.exit(f"--source {args.source} does not support --metric {args.metric}; "
                  f"it supports: {', '.join(SOURCES[args.source]['metrics'])}")

@@ -47,11 +47,12 @@ Credentials do not have to be typed each time: see [Credentials](#credentials).
 
 ## Sources and metrics
 
-ragdoll reads from two sources, chosen with `--source` (`gui` is accepted as another name for `web`):
+ragdoll reads from three sources, chosen with `--source` (`gui` is accepted as another name for `web`):
 
 | Source | Metrics | How it works | History |
 |---|---|---|---|
 | `web` (default; also `gui`) | temperature | Logs in to the iDRAC web interface and downloads the temperature statistics CSV | Hourly history held by the iDRAC |
+| `redfish` | none: the [hardware inventory](#hardware-inventory) only | Reads the inventory from the iDRAC's Redfish API over HTTPS | The inventory is a snapshot, so there is no history |
 | `snmp` | temperature, fan, power, voltage, health, network | Reads the current value from the Dell probe tables (and the standard interface counters) over SNMP v2c | Only the current value; each run appends a reading to the local cache, so history builds up over time |
 
 `--metric` chooses what to read (default `temperature`) and `--sensor` picks one sensor of that metric. Every metric
@@ -210,6 +211,35 @@ raid-battery  Battery on Integrated RAID Controller 1  state=ready; status=ok
 `XXXX`; the real listing includes them, so take care when sharing it.)
 
 `--get inventory` produces exactly the same listing as `--list inventory`, in every format.
+
+**Over Redfish.** The inventory can also be read from the iDRAC's Redfish API, which is useful where SNMP is turned off
+or blocked. Use `--source redfish` (or `--source web`, the iDRAC's web interface, which is where Redfish lives); the
+default for the inventory stays `snmp`. It needs the web credentials (`--user` and `--pass`, or the keyring) instead
+of the SNMP community.
+
+```
+python3 ragdoll.py --host 192.0.2.20 --source redfish --get inventory --category memory --name DIMM.Socket.A1
+```
+
+Everything else works the same: `--category`, `--name`, `--detail`, `--field` and every `--output`. The two sources
+describe the hardware a little differently:
+
+| | `snmp` | `redfish` |
+|---|---|---|
+| `firmware` | 2 items (the iDRAC and Lifecycle Controller) | every installed firmware: BIOS aside, 11 items on the test server (PERC, backplane, NIC, power supply, CPLD ...) |
+| `controller` | 2 | 4, including the SATA controllers |
+| `pci` | 23 devices, named like `Video.Embedded.1-1` | 12 devices, named by bus position like `0-3` |
+| `raid-battery` | yes | not available over Redfish |
+| virtual disk `layout` | `RAID 5` | `RAID 5 or RAID 6`, because Redfish reports only "striped with parity" |
+| other differences | CPU `model`, `enabled-cores`, current `speed`; NIC `product`, `link`; disk `state` | `system` `power` and `manufacturer`; memory `type`; NIC `speed` and `description` |
+
+The names of the memory modules (`DIMM.Socket.A1`), network ports, processors, disks and virtual disks are the same in
+both, so the same `--name` works with either source.
+
+**Redfish is slow on an iDRAC8.** With a password, every request takes 5 to 9 seconds, because the iDRAC checks it
+each time. ragdoll therefore logs in once with a session token (about 10 seconds), after which each request takes under
+a second, and logs out at the end; it makes a few requests at a time. A full inventory took 43 seconds, and one
+category such as `--category cpu` about 12. SNMP takes 5 seconds for everything.
 
 **Choosing part of the inventory.** `--category` limits it to one category (`system`, `idrac`, `bios`, `firmware`,
 `cpu`, `memory`, `nic`, `pci`, `controller`, `disk`, `virtual-disk` or `raid-battery`), and `--name` limits it to the
@@ -514,7 +544,8 @@ python3 ragdoll.py --host 192.0.2.10 --last week --chart line
 python3 ragdoll.py --host 192.0.2.10 --forget-credentials
 ```
 
-- Entries are stored per host, under the service name `ragdoll:<host>`. `--save-credentials` saves for `--source`, or
+- Entries are stored per host, under the service name `ragdoll:<host>`. The web and redfish sources use the same
+  user name and password. `--save-credentials` saves for `--source`, or
   for the source named after `--list`, otherwise for `web`.
 - On a machine without a keyring (a headless server or a cron job), use the `IDRAC_USER`, `IDRAC_PASS` and
   `IDRAC_COMMUNITY` environment variables instead, for example loaded from a file with mode 600.
@@ -549,7 +580,7 @@ horizontal`; for just the current value, use [`--get`](#getting-a-current-value)
 | Option | What it does |
 |---|---|
 | `--host HOST` | the iDRAC's address (required) |
-| `--source web\|snmp` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get` |
+| `--source web\|snmp\|redfish` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get` and for the inventory. `redfish` (and `web`) read the inventory over Redfish |
 | `--metric M` | `temperature`, `fan`, `power`, `voltage`, `health` or `network`; default `temperature` |
 | `--sensor S` | which sensor of the metric; the default depends on the metric |
 | `--list [sensors\|inventory\|SOURCE\|METRIC]` | list the sensors, or the hardware inventory, and exit |
@@ -725,7 +756,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
 
 ## Version
 
-Current version: **0.4.0**. Print it with `python3 ragdoll.py --version`.
+Current version: **0.4.1**. Print it with `python3 ragdoll.py --version`.
 
 Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
