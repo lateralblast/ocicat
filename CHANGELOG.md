@@ -8,10 +8,33 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.5.1 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.5.2 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+## [0.5.2] - 2026-10-06
+
+### Added
+- `--source lmsensors` works on macOS, for this computer: temperature, fan, power and voltage, with no package to install.
+  Tested on an Apple silicon MacBook Pro (M1 Max). Under a full CPU load the die temperatures rose from 28 to 34 °C, CPU
+  power from 0.4 to 36 W and the fans from stopped to about 2,100 RPM.
+  - `temperature`: the HID temperature sensors (`pmu-tdie0`, `pmu-tdev1`, `nand-ch0-temp`, `gas-gauge-battery-1` ...), read from
+    IOKit with `ctypes`, without root. A sensor at several locations is numbered (`-1`, `-2`); duplicates at one location are
+    averaged.
+  - `fan`: the SMC (`fan1`, `fan2`), read through the AppleSMC user client with `ctypes`, without root. Handles Apple silicon
+    floats and Intel `fpe2` values (Intel is untested).
+  - `power`: `system-power`, `adapter-power` and `adapter-current` from the SMC; `battery-power` and `battery-current` from
+    `ioreg -a` (parsed with `plistlib`); `cpu-power`, `gpu-power`, `ane-power` and `package-power` from `powermetrics`, run
+    with `sudo -n` and left out when sudo refuses. `powermetrics` is skipped when the sensor asked for is available without it.
+  - `voltage`: `adapter-voltage` (SMC) and `battery-voltage` (`ioreg`).
+- The default sensor on macOS is `pmu-tdie0`, `system-power` or `battery-voltage`, by metric.
+
+### Notes
+- `ioreg`'s `PowerTelemetryData` (`SystemLoad`, `SystemPowerIn`) refreshes only about every 50 seconds, so it is not used for
+  live power; the SMC keys `PSTR`, `PDTR`, `ID0R` and `VD0R` change on every read.
+- Thermal pressure from `powermetrics` is not a number, so it is not a sensor.
+- `--source lmsensors --host` still runs `sensors -j` on the remote computer, so it needs Linux there.
 
 ## [0.5.1] - 2026-10-06
 

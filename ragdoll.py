@@ -11,6 +11,8 @@ import argparse
 import asyncio
 import atexit
 import calendar
+import ctypes
+import ctypes.util
 import collections
 import concurrent.futures
 import contextlib
@@ -25,12 +27,14 @@ import json
 import logging
 import os
 import platform
+import plistlib
 import re
 import shlex
 import shutil
 import signal
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -71,7 +75,7 @@ install_missing_modules()
 import requests
 import urllib3
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 
 class SourceError(Exception):
@@ -1126,8 +1130,284 @@ def ssh_run(args, command):
                 raise SourceError(f"{command} failed over ssh on {args.host}: {e}")
 
 
+# --- macOS: there is no lm-sensors, so --source lmsensors reads what macOS itself exposes (this computer only) ---
+# temperature: the HID temperature sensors (die, board, SSD, battery), read from IOKit with ctypes so that no module has to
+#   be installed, and without root. The same sensor can be exposed twice, so readings with one name and location are averaged.
+# voltage, power: the battery and charger, from `ioreg -a` (AppleSmartBattery), without root; and CPU, GPU and ANE power from
+#   `powermetrics`, which needs root: it is run with `sudo -n` (never a password prompt) and left out if that is refused.
+# system power, adapter figures and fans: the SMC (mac_smc), with no root; ioreg's copies of the system and adapter figures
+#   are only refreshed about once a minute, so they are not used.
+_MAC_IOKIT = {}  # the loaded libraries and their function signatures, filled in by mac_iokit
+
+
+def mac_iokit():
+    """Load CoreFoundation and IOKit once and declare the functions used to read the HID temperature sensors."""
+    if _MAC_IOKIT:
+        return _MAC_IOKIT["cf"], _MAC_IOKIT["io"]
+    paths = ctypes.util.find_library("CoreFoundation"), ctypes.util.find_library("IOKit")
+    if not all(paths):
+        raise SourceError("could not find the CoreFoundation and IOKit frameworks")
+    cf, io = ctypes.CDLL(paths[0]), ctypes.CDLL(paths[1])
+    vp, i32, i64 = ctypes.c_void_p, ctypes.c_int32, ctypes.c_int64
+    for lib, name, restype, argtypes in (
+            (cf, "CFStringCreateWithCString", vp, [vp, ctypes.c_char_p, ctypes.c_uint32]),
+            (cf, "CFNumberCreate", vp, [vp, ctypes.c_int, vp]),
+            (cf, "CFDictionaryCreate", vp, [vp, ctypes.POINTER(vp), ctypes.POINTER(vp), ctypes.c_long, vp, vp]),
+            (cf, "CFArrayGetCount", ctypes.c_long, [vp]), (cf, "CFArrayGetValueAtIndex", vp, [vp, ctypes.c_long]),
+            (cf, "CFGetTypeID", ctypes.c_ulong, [vp]), (cf, "CFStringGetTypeID", ctypes.c_ulong, []),
+            (cf, "CFNumberGetTypeID", ctypes.c_ulong, []), (cf, "CFRelease", None, [vp]),
+            (cf, "CFStringGetCString", ctypes.c_bool, [vp, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]),
+            (cf, "CFNumberGetValue", ctypes.c_bool, [vp, ctypes.c_int, vp]),
+            (io, "IOHIDEventSystemClientCreate", vp, [vp]), (io, "IOHIDEventSystemClientSetMatching", None, [vp, vp]),
+            (io, "IOHIDEventSystemClientCopyServices", vp, [vp]),
+            (io, "IOHIDServiceClientCopyProperty", vp, [vp, vp]),
+            (io, "IOHIDServiceClientCopyEvent", vp, [vp, i64, i32, i64]),
+            (io, "IOHIDEventGetFloatValue", ctypes.c_double, [vp, i32])):
+        function = getattr(lib, name)
+        function.restype, function.argtypes = restype, argtypes
+    _MAC_IOKIT.update(cf=cf, io=io)
+    return cf, io
+
+
+def mac_hid_temperatures():
+    """Return [(sensor name, location id, degrees C)] from every HID temperature sensor that has a reading."""
+    cf, io = mac_iokit()
+    utf8 = 0x08000100  # kCFStringEncodingUTF8
+
+    def string(text):
+        return cf.CFStringCreateWithCString(None, text.encode(), utf8)
+
+    def number(value):
+        c = ctypes.c_int32(value)
+        return cf.CFNumberCreate(None, 9, ctypes.byref(c))  # kCFNumberSInt32Type
+
+    def prop(service, key):
+        k = string(key)
+        p = io.IOHIDServiceClientCopyProperty(service, k)
+        cf.CFRelease(k)
+        if not p:
+            return None
+        try:
+            kind = cf.CFGetTypeID(p)
+            if kind == cf.CFStringGetTypeID():
+                buf = ctypes.create_string_buffer(128)
+                return buf.value.decode(errors="replace") if cf.CFStringGetCString(p, buf, 128, utf8) else None
+            if kind == cf.CFNumberGetTypeID():
+                c = ctypes.c_int64()
+                return c.value if cf.CFNumberGetValue(p, 4, ctypes.byref(c)) else None  # kCFNumberSInt64Type
+        finally:
+            cf.CFRelease(p)
+
+    objects = [string("PrimaryUsagePage"), string("PrimaryUsage"), number(0xFF00), number(5)]  # vendor page, temperature
+    match = cf.CFDictionaryCreate(None, (ctypes.c_void_p * 2)(*objects[:2]), (ctypes.c_void_p * 2)(*objects[2:]), 2, None, None)
+    client = io.IOHIDEventSystemClientCreate(None)
+    if not client:
+        raise SourceError("could not open the HID event system to read the temperature sensors")
+    found = []
+    try:
+        io.IOHIDEventSystemClientSetMatching(client, match)
+        services = io.IOHIDEventSystemClientCopyServices(client)
+        if services:
+            try:
+                for i in range(cf.CFArrayGetCount(services)):
+                    service = cf.CFArrayGetValueAtIndex(services, i)
+                    event = io.IOHIDServiceClientCopyEvent(service, 15, 0, 0)  # kIOHIDEventTypeTemperature
+                    if not event:
+                        continue  # a sensor with no reading (the ambient light sensor, for one)
+                    try:
+                        degrees = io.IOHIDEventGetFloatValue(event, 15 << 16)
+                    finally:
+                        cf.CFRelease(event)
+                    name = prop(service, "Product")
+                    if name and -40 < degrees < 150:
+                        found.append((name, prop(service, "LocationID") or 0, degrees))
+            finally:
+                cf.CFRelease(services)
+    finally:
+        cf.CFRelease(client)
+        cf.CFRelease(match)
+        for obj in objects:
+            cf.CFRelease(obj)
+    return found
+
+
+def mac_temperatures():
+    """{sensor: Reading}: one sensor per product, or per product and location when it appears at several (-1, -2 ...)."""
+    places = {}
+    for name, location, degrees in mac_hid_temperatures():
+        places.setdefault(lm_slug(name), {}).setdefault(location, []).append(degrees)
+    found = {}
+    for name, locations in places.items():
+        for n, location in enumerate(sorted(locations), 1):
+            values = locations[location]
+            found[name if len(locations) == 1 else f"{name}-{n}"] = Reading(
+                f"hid/{location}", round(sum(values) / len(values), 2), None)
+    return found
+
+
+def mac_battery():
+    """The AppleSmartBattery registry entry as a dict, or {} on a Mac without a battery."""
+    try:
+        run = subprocess.run(["ioreg", "-a", "-r", "-n", "AppleSmartBattery"], capture_output=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        raise SourceError(f"could not run ioreg: {e}")
+    if run.returncode != 0 or not run.stdout.strip():
+        return {}
+    try:
+        entries = plistlib.loads(run.stdout)
+    except Exception as e:  # plistlib raises several kinds
+        raise SourceError(f"ioreg did not return a property list: {e}")
+    return entries[0] if entries else {}
+
+
+def mac_powermetrics():
+    """{sensor: Reading} of CPU, GPU, ANE and combined power in watts. Needs root, so sudo -n; {} when that is refused."""
+    command = ["powermetrics", "--samplers", "cpu_power,gpu_power,ane_power", "-n", "1", "-i", "500"]
+    if os.geteuid() != 0:
+        command = ["sudo", "-n"] + command
+    try:
+        run = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    if run.returncode != 0:
+        return {}
+    found = {}
+    for label, name in (("CPU", "cpu-power"), ("GPU", "gpu-power"), ("ANE", "ane-power"),
+                        (r"Combined Power \(CPU \+ GPU \+ ANE", "package-power")):
+        m = re.search(rf"^{label}(?: Power)?\)?: (\d+) mW", run.stdout, re.M)
+        if m:
+            found[name] = Reading(f"powermetrics/{name}", int(m.group(1)) / 1000, None)
+    return found
+
+
+def _signed(value):
+    """ioreg prints a negative 64-bit current (the battery discharging) as a huge unsigned number."""
+    return value - (1 << 64) if value >= 1 << 63 else value
+
+
+def mac_read(args):
+    """Return {sensor: Reading} for args.metric on a Mac (see the comment above mac_iokit)."""
+    if args.metric == "temperature":
+        return mac_temperatures()
+    if args.metric == "fan":
+        return mac_fans()
+    battery = mac_battery()
+    found = {}
+
+    def add(name, value, divisor, source):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            found[name] = Reading(f"{source}/{name}", round(value / divisor, 4), None)
+
+    try:  # live system and adapter figures; ioreg's own copies of them refresh only about once a minute
+        with mac_smc() as read:
+            if args.metric == "voltage":
+                add("adapter-voltage", read("VD0R"), 1, "smc")
+            else:
+                add("system-power", read("PSTR"), 1, "smc")
+                add("adapter-power", read("PDTR"), 1, "smc")
+                add("adapter-current", read("ID0R"), 1, "smc")
+    except SourceError as e:
+        print(f"lmsensors: {e}; the adapter and system figures are left out", file=sys.stderr)
+    if args.metric == "voltage":
+        add("battery-voltage", battery.get("Voltage"), 1000, "ioreg")
+    else:
+        amps = battery.get("InstantAmperage", battery.get("Amperage"))
+        if isinstance(amps, int) and isinstance(battery.get("Voltage"), int):
+            amps = _signed(amps) / 1000  # negative while the battery discharges
+            found["battery-current"] = Reading("ioreg/battery-current", round(amps, 4), None)
+            found["battery-power"] = Reading("ioreg/battery-power", round(amps * battery["Voltage"] / 1000, 4), None)
+        if getattr(args, "sensor", None) not in found:  # powermetrics needs sudo and half a second: only when it is wanted
+            found.update(mac_powermetrics())
+    return found
+
+
+# The SMC is read with one struct call (IOConnectCallStructMethod, selector 2): data8 9 asks for a key's type and size,
+# data8 5 for its bytes. The struct is 80 bytes (the keys are four-character codes such as F0Ac, fan 0's actual speed).
+class _SmcVers(ctypes.Structure):
+    _fields_ = [("major", ctypes.c_uint8), ("minor", ctypes.c_uint8), ("build", ctypes.c_uint8),
+                ("reserved", ctypes.c_uint8), ("release", ctypes.c_uint16)]
+
+
+class _SmcLimits(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint16), ("length", ctypes.c_uint16), ("cpu", ctypes.c_uint32),
+                ("gpu", ctypes.c_uint32), ("mem", ctypes.c_uint32)]
+
+
+class _SmcInfo(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_uint32), ("type", ctypes.c_uint32), ("attributes", ctypes.c_uint8)]
+
+
+class _SmcKey(ctypes.Structure):
+    _fields_ = [("key", ctypes.c_uint32), ("vers", _SmcVers), ("limits", _SmcLimits), ("info", _SmcInfo),
+                ("result", ctypes.c_uint8), ("status", ctypes.c_uint8), ("data8", ctypes.c_uint8),
+                ("data32", ctypes.c_uint32), ("bytes", ctypes.c_uint8 * 32)]
+
+
+@contextlib.contextmanager
+def mac_smc():
+    """Open the SMC and yield read(key): the number in that key, or None if this Mac does not have it."""
+    cf, io = mac_iokit()
+    libsystem = ctypes.CDLL(ctypes.util.find_library("System"))
+    vp, uint = ctypes.c_void_p, ctypes.c_uint
+    io.IOServiceMatching.restype, io.IOServiceMatching.argtypes = vp, [ctypes.c_char_p]
+    io.IOServiceGetMatchingService.restype, io.IOServiceGetMatchingService.argtypes = uint, [uint, vp]
+    io.IOServiceOpen.restype, io.IOServiceOpen.argtypes = ctypes.c_int, [uint, uint, uint, ctypes.POINTER(uint)]
+    io.IOServiceClose.restype, io.IOServiceClose.argtypes = ctypes.c_int, [uint]
+    io.IOObjectRelease.restype, io.IOObjectRelease.argtypes = ctypes.c_int, [uint]
+    io.IOConnectCallStructMethod.restype = ctypes.c_int
+    io.IOConnectCallStructMethod.argtypes = [uint, uint, vp, ctypes.c_size_t, vp, ctypes.POINTER(ctypes.c_size_t)]
+    service = io.IOServiceGetMatchingService(0, io.IOServiceMatching(b"AppleSMC"))
+    if not service:
+        raise SourceError("this Mac has no AppleSMC to read")
+    connection = uint()
+    try:
+        status = io.IOServiceOpen(service, uint.in_dll(libsystem, "mach_task_self_").value, 0, ctypes.byref(connection))
+    finally:
+        io.IOObjectRelease(service)
+    if status != 0:
+        raise SourceError(f"could not open the SMC (IOServiceOpen returned {status:#x})")
+
+    def call(request):
+        reply, size = _SmcKey(), ctypes.c_size_t(ctypes.sizeof(_SmcKey))
+        failed = io.IOConnectCallStructMethod(connection.value, 2, ctypes.byref(request), ctypes.sizeof(_SmcKey),
+                                              ctypes.byref(reply), ctypes.byref(size))
+        return None if failed or reply.result else reply
+
+    def read(name):
+        request = _SmcKey(key=struct.unpack(">I", name.encode())[0], data8=9)
+        info = call(request)
+        if info is None:
+            return None
+        request.info.size, request.data8 = info.info.size, 5
+        reply = call(request)
+        if reply is None:
+            return None
+        kind, raw = struct.pack(">I", info.info.type).decode(errors="replace"), bytes(reply.bytes[:info.info.size])
+        if kind == "flt " and len(raw) == 4:  # Apple silicon: a little-endian float
+            return struct.unpack("<f", raw)[0]
+        if kind == "fpe2" and len(raw) == 2:  # Intel: unsigned fixed point with two fraction bits
+            return int.from_bytes(raw, "big") / 4
+        if kind in ("ui8 ", "ui16", "ui32", "si8 ", "si16", "si32"):
+            return int.from_bytes(raw, "big", signed=kind.startswith("si"))
+        return None
+
+    try:
+        yield read
+    finally:
+        io.IOServiceClose(connection.value)
+
+
+def mac_fans():
+    """{fan1: Reading, ...} in RPM; none on a Mac without fans. A stopped fan reads 0, which is real (idle MacBook Pro)."""
+    with mac_smc() as read:
+        return {f"fan{n}": Reading(f"smc/F{n - 1}Ac", round(read(f"F{n - 1}Ac") or 0), None)
+                for n in range(1, int(read("FNum") or 0) + 1) if read(f"F{n - 1}Ac") is not None}
+
+
 def lm_read(args):
     """Return {sensor: Reading} for args.metric from `sensors -j`. A sensor is named <chip>-<label>."""
+    if platform.system() == "Darwin" and not args.remote:
+        return mac_read(args)
     where = f"on {args.host}" if args.remote else "on this computer"
     if args.remote:
         status, stdout, stderr = lm_run_remote(args)
@@ -1174,7 +1454,7 @@ def default_sensor(args, metric):
     names = sorted(lm_read(args))
     if not names:
         raise SourceError(f"lm-sensors {'on ' + args.host if args.remote else 'on this computer'} has no {args.metric} sensors")
-    for hint in ("package-id-0", "tctl", "composite", "cpu"):  # the CPU or the main drive, if there is one
+    for hint in ("package-id-0", "tctl", "composite", "pmu-tdie0", "system-power", "battery-voltage", "cpu"):  # the CPU, or the main drive
         for name in names:
             if hint in name:
                 return name

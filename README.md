@@ -33,7 +33,7 @@ the Python running it, with `--user` for a system Python it cannot write to) and
 `RAGDOLL_NO_INSTALL=1` in the environment, turns this off. If pip fails (for example on a Python marked as externally
 managed), ragdoll prints a warning and carries on; use a virtual environment there.
 
-The `lmsensors` source also needs the `lm-sensors` package, which is a system package and not a Python one (for example
+On Linux, the `lmsensors` source also needs the `lm-sensors` package, which is a system package and not a Python one (for example
 `sudo apt install lm-sensors`, then `sudo sensors-detect` once to find the hardware). Nothing else needs it.
 
 ragdoll is a single script, `ragdoll.py`. It was written and tested with Python 3.14 and uses the standard `zoneinfo`
@@ -61,7 +61,7 @@ ragdoll reads from seven sources, chosen with `--source` (`gui` is accepted as a
 | Source | Metrics | How it works | History |
 |---|---|---|---|
 | `web` (default; also `gui`) | temperature | Logs in to the iDRAC web interface and downloads the temperature statistics CSV | Hourly history held by the iDRAC |
-| `lmsensors` | temperature, fan, power, voltage | Reads the sensors of the computer ragdoll runs on, through `sensors -j` from lm-sensors. No `--host` or login needed | Only the current value; each run appends a reading to the local cache, as with snmp |
+| `lmsensors` | temperature, fan, power, voltage | Reads the sensors of the computer ragdoll runs on, through `sensors -j` from lm-sensors (on macOS, from the HID sensors, the SMC and the battery, see [below](#macos)). No `--host` or login needed | Only the current value; each run appends a reading to the local cache, as with snmp |
 | `wsman` | none: the [hardware inventory](#hardware-inventory) only | Reads part of the inventory over WS-Man (HTTPS) with the `python-dracclient` module: no ssh and no racadm | The inventory is a snapshot, so there is no history |
 | `racadm` | none: the [hardware inventory](#hardware-inventory) only | Runs Dell's `racadm` commands (`hwinventory`, `swinventory`, `getsysinfo`) in the iDRAC's ssh shell | The inventory is a snapshot, so there is no history |
 | `redfish` | none: the [hardware inventory](#hardware-inventory) only | Reads the inventory from the iDRAC's Redfish API over HTTPS | The inventory is a snapshot, so there is no history |
@@ -724,6 +724,45 @@ warn -0.15..81.85 crit -..85.85
 $ python3 ragdoll.py --source lmsensors --tail --poll 60 --output db      # log it every minute
 ```
 
+### macOS
+
+There is no lm-sensors on a Mac, so on macOS `--source lmsensors` reads what macOS itself exposes, with no package to
+install and no root (except for CPU, GPU and ANE power, below). It reads this computer only: `--host` still runs
+`sensors -j` on the other computer, which has to be Linux with lm-sensors. It was written and tested on an Apple silicon
+MacBook Pro (M1 Max); Intel Macs and Macs with no battery or fans are not tested.
+
+```
+$ python3 ragdoll.py --source lmsensors --list --metric power
+SOURCE     METRIC  SENSOR           UNIT    VALUE  LIMITS  KEY
+lmsensors  power   adapter-current  A      0.7866  -       smc/adapter-current
+lmsensors  power   adapter-power    W     15.9962  -       smc/adapter-power
+lmsensors  power   ane-power        W           0  -       powermetrics/ane-power
+lmsensors  power   battery-current  A           0  -       ioreg/battery-current
+lmsensors  power   battery-power    W           0  -       ioreg/battery-power
+lmsensors  power   cpu-power        W       0.238  -       powermetrics/cpu-power
+lmsensors  power   gpu-power        W       0.069  -       powermetrics/gpu-power
+lmsensors  power   package-power    W       0.306  -       powermetrics/package-power
+lmsensors  power   system-power     W     10.1068  -       smc/system-power
+```
+
+| Metric | Sensors | Where from |
+|---|---|---|
+| `temperature` | `pmu-tdie0` to `pmu-tdie10` (CPU die), `pmu-tdev1` to `8`, `pmu-tp0s` ..., `pmu-tcal`, `nand-ch0-temp` (the SSD), `gas-gauge-battery-1` to `6` | The HID temperature sensors in IOKit (read with `ctypes`) |
+| `fan` | `fan1`, `fan2`, ... | The SMC. A stopped fan reads 0, which is real: an idle MacBook Pro keeps its fans off, and they reached 2,100 RPM under a full load |
+| `power` | `system-power`, `adapter-power`, `adapter-current` | The SMC (live) |
+| | `battery-power`, `battery-current` | `ioreg` (`AppleSmartBattery`); negative while the battery discharges |
+| | `cpu-power`, `gpu-power`, `ane-power`, `package-power` | `powermetrics`, which needs root: ragdoll runs it with `sudo -n`, which never asks for a password, and leaves these out if sudo refuses. It adds about half a second to a read |
+| `voltage` | `adapter-voltage`, `battery-voltage` | The SMC and `ioreg` |
+
+- **Sensor names:** a sensor that macOS exposes at several places gets `-1`, `-2` ... in order of its location id, which is
+  stable on one Mac. The same sensor listed twice at one place is averaged. Names differ between Mac models, so use
+  `--list` to see yours. `fan`, `power` and `voltage` need no `--sensor` either: the defaults are `pmu-tdie0`,
+  `system-power` and `battery-voltage`.
+- **Only the live values are used.** `ioreg` also reports `SystemLoad` and the adapter's power, but the system refreshes those
+  about once a minute, so ragdoll takes them from the SMC instead.
+- **Not available:** thermal pressure (`powermetrics --samplers thermal` reports it as Nominal, Moderate, Heavy ...) is not a
+  number, so it is not a sensor. There are no limits, because macOS does not publish any.
+
 ### Another computer, over ssh
 
 Give `--host` (and `--user`, if the login name is not yours) and ragdoll runs `sensors -j` on that computer over ssh.
@@ -862,7 +901,7 @@ A systemd service or a terminal multiplexer is a good place to run it. For one r
 | Option | What it does |
 |---|---|
 | `--host HOST` | the iDRAC's address (required, except with `--source lmsensors` or `system`: without it this computer is read, with it that computer over ssh) |
-| `--source web\|snmp\|redfish\|racadm\|wsman\|lmsensors\|system` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get`, `--tail` and for the inventory. `redfish` (and `web`) read the inventory over Redfish, `racadm` with racadm, `wsman` over WS-Man; `lmsensors` reads this computer's sensors and `system` its inventory |
+| `--source web\|snmp\|redfish\|racadm\|wsman\|lmsensors\|system` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get`, `--tail` and for the inventory. `redfish` (and `web`) read the inventory over Redfish, `racadm` with racadm, `wsman` over WS-Man; `lmsensors` reads this computer's sensors (with lm-sensors, or on macOS its own sensors) and `system` its inventory |
 | `--metric M` | `temperature`, `fan`, `power`, `voltage`, `health` or `network`; default `temperature` |
 | `--sensor S` | which sensor of the metric; the default depends on the metric |
 | `--list [sensors\|inventory\|SOURCE\|METRIC]` | list the sensors, or the hardware inventory, and exit |
@@ -1040,7 +1079,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
 
 ## Version
 
-Current version: **0.5.1**. Print it with `python3 ragdoll.py --version`.
+Current version: **0.5.2**. Print it with `python3 ragdoll.py --version`.
 
 Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
