@@ -2,21 +2,18 @@
 
 Redfish/API/GUI/DRAC/Other Log Linter - Converts iDRAC Telemetry and other information into more useful formats.
 
-At the moment it fetches temperature, fan speed and power data from a Dell iDRAC and draws it as a chart in the terminal.
+ragdoll reads telemetry from a Dell iDRAC and turns it into something you can use: a chart in the terminal, a table,
+CSV, or an Excel spreadsheet. It currently reads temperatures, fan speeds, power, voltage, component health and
+management-network traffic, through the iDRAC's web interface or over SNMP.
 
-It can read from two sources:
-
-| Source | Metrics | How it works | History |
-|---|---|---|---|
-| `web` (default; also `gui`) | temperature | Logs in to the iDRAC web interface and downloads the temperature statistics CSV | Hourly history held by the iDRAC |
-| `snmp` | temperature, fan, power | Reads the current value from the Dell probe tables over SNMP v2c | Only the current value; each run appends a reading to the local cache, so history builds up over time |
-
-## Version
-
-Current version: **0.3.0**. Print it with `python3 ragdoll.py --version`.
-
-Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next,
-so 0.0.9 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
+- [Install](#install) and [quick start](#quick-start)
+- [Sources and metrics](#sources-and-metrics): what can be read, and the SNMP-only extras
+- [Listing sensors](#listing-sensors) and [getting a current value](#getting-a-current-value)
+- [Charts](#charts) and [other outputs](#other-outputs): table, CSV, spreadsheets
+- [Time zones](#time-zones)
+- [Storage](#storage): cache, SQLite database, offline use
+- [Credentials](#credentials) and [running regularly](#running-regularly)
+- [Option reference](#option-reference), [example output](#example-output) and [notes](#notes)
 
 ## Install
 
@@ -24,172 +21,239 @@ so 0.0.9 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed
 pip install -r requirements.txt
 ```
 
-This installs `requests` (web source), `pysnmp` (snmp source), `keyring` (saved credentials), `terminaltables` (table output), `XlsxWriter` and `xlwt` (`.xlsx` and `.xls` output), and the two graphing modules, `plotext` and `termgraph`.
+This installs `requests` (web source), `pysnmp` (snmp source), `keyring` (saved credentials), `terminaltables` (table
+output), `XlsxWriter` and `xlwt` (`.xlsx` and `.xls` output), and the two graphing modules, `plotext` and `termgraph`.
 `plotext` is pinned to 5.3.2 because 6.x has a different API.
 
-## Capabilities
+ragdoll is a single script, `ragdoll.py`. It was written and tested with Python 3.14 and uses the standard `zoneinfo`
+module, so it needs at least Python 3.9; older versions have not been tried.
 
-- **Sources:** `--source web|snmp`.
-- **Source names:** `gui` is an alias for `web` in `--source` and `--list`, for example `--source gui`.
-- **Metrics:** `--metric temperature|fan|power` (default `temperature`). `fan` and `power` need `--source snmp`.
-- **Sensors:** `--list` prints an aligned table of `source`, `metric`, `sensor` and the iDRAC's key for every sensor, from every source and metric.
-  A source or metric after it narrows the listing (`--list snmp`, `--list fan`), and so do `--source` and `--metric`.
-  A source that can't be reached or needs credentials you haven't given is reported on stderr and skipped.
-  `--sensor` selects one sensor to graph.
-  Unknown sensor names are rejected. The defaults are `inlet`, `fan1a` and `system-power`.
-
-  | Metric | Unit | Example sensors (snmp) |
-  |---|---|---|
-  | `temperature` | °C | `inlet`, `exhaust`, `cpu1`, `cpu2` (the web source offers `inlet` only) |
-  | `fan` | RPM | `fan1a`, `fan1b`, `fan2a` ... `fan7b` |
-  | `power` | W or A | `system-power` (watts), `ps1-current`, `ps2-current` (amps) |
-- **Credentials:** never stored in the script. The web source takes `--user` and `--pass` (also spelt `--username` and `--password`); the snmp source takes `--community`.
-  Missing credentials are looked up in this order: command-line flag, environment variable
-  (`IDRAC_USER`, `IDRAC_PASS`, `IDRAC_COMMUNITY`), the OS keyring, and finally a password prompt.
-  See [Saving credentials](#saving-credentials).
-- **Output:** `--output chart|table|raw|csv|xlsx|xls` selects what is produced from the readings (default `chart`).
-  `table` uses `terminaltables`; `raw` and `csv` print CSV; `xlsx` and `xls` write a spreadsheet, named with `--file`.
-  Other kinds of output can be added later without changing the other options; `--module`, `--chart`, `--width` and
-  `--height` apply to `chart` only. See [Table output](#table-output), [CSV output](#csv-output) and
-  [Spreadsheet output](#spreadsheet-output).
-- **Charts:** `--chart vertical|horizontal|stacked|histogram|line|scatter` (default `vertical`).
-  `line` and `scatter` need plotext.
-- **Graphing module:** `--module plotext|termgraph` (default `plotext`).
-- **Size:** `--width` (default 80) and `--height` (default 24) fit a standard terminal.
-  termgraph ignores `--height`.
-- **Time range:** `--last` takes a row count (default `10`) or a period such as `hour`, `day`, `week`, `month`, `year`, `6h`, `2d`.
-  Periods are counted back from the newest sample in the data, not from the local clock.
-- **Caching:** data is cached per host, source, metric and sensor, for example `<host>_snmp_fan-fan1a.csv`.
-  - Location: `~/.cache/ragdoll` (or `$XDG_CACHE_HOME/ragdoll`), changed with `--cachedir` (`--cache-dir` also works).
-  - Web data is reused until it is `--max-age` seconds old (default 3600); `--refresh` forces a fetch.
-  - If a fetch fails and a cache file exists, the cache is used and a warning is printed.
-  - The snmp source polls on every run.
-- **SQLite database:** `--db [PATH]` also stores the readings in a SQLite database and charts from it, so history from
-  earlier runs is included. See [Storing readings in SQLite](#storing-readings-in-sqlite).
-- **Offline charts:** `--no-fetch` charts what is already stored without contacting the iDRAC.
-  See [Charting without contacting the iDRAC](#charting-without-contacting-the-idrac).
-- **Time zones:** all times are kept in UTC and shown in local time. `--tz ZONE` shows a named zone instead
-  (for example `--tz Australia/Sydney`), `--utc` shows UTC, and `--tz-offset` sets the web source's clock offset. See [Time zones](#time-zones).
-- **Raw output:** `--raw` prints the CSV instead of a chart. Its times are UTC, for example `2026-10-06T04:27:44Z`.
-- **TLS:** the iDRAC certificate is not verified by default (they are usually self-signed); `--secure` turns verification on.
-
-## Time zones
-
-Times from the two sources are in different clocks, so ragdoll converts everything to **UTC** when it reads or
-polls, and stores it that way: as ISO 8601 text ending in `Z` in the cache and `--raw` output, and as Unix
-timestamps in the database. Charts convert back to your computer's local time (the time zone name is shown in the
-title, for example `[AEDT]`).
-
-- `--tz ZONE` shows any named time zone instead, using the IANA names from your system's time zone database,
-  for example `--tz Australia/Sydney`, `--tz America/New_York` or `--tz Asia/Tokyo`. Daylight saving is applied,
-  so the same sample can show as `[EDT]` in summer and `[EST]` in winter.
-- `--utc` is the same as `--tz UTC`. The two cannot be combined.
-- `--tz` only changes how times are displayed. It is unrelated to `--tz-offset`, which says what time the
-  iDRAC's own clock shows, so that its CSV can be converted to UTC.
-
-- **snmp:** the iDRAC does not report a time over SNMP, so each reading is stamped with this computer's clock at the
-  moment it was polled. Keep this computer's clock correct (for example with NTP).
-- **web:** the iDRAC's CSV uses the iDRAC's own wall clock with no time zone. ragdoll converts it to UTC using the
-  clock's offset from UTC, which it measures by comparing the iDRAC's clock (read through Redfish) with this
-  computer's clock, rounded to the nearest quarter hour. It does not trust the time zone configured on the iDRAC,
-  because an iDRAC can show UTC while set to another time zone. If Redfish is unavailable, or you want to override
-  the measurement, pass `--tz-offset` (for example `--tz-offset UTC`, `+10:00` or `-05:00`). Conversion happens
-  when the data is fetched, so the cached copy and the database are already in UTC.
-- Cache files and databases written by versions before 0.2.0 stored local or iDRAC times with no zone. They are
-  not read: an old cache is refetched or ignored, and an old database is refused with a message. Delete the
-  database and run again to rebuild it.
-
-## Storing readings in SQLite
-
-`--db` keeps every reading in a SQLite database, using Python's built-in `sqlite3` module (nothing extra to install).
-The charts are then drawn from the database, so they include readings from every earlier run and from both the
-web source and snmp.
+## Quick start
 
 ```
-python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --db --chart line --last week
-python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --db /path/to/readings.db --raw
+# what can this iDRAC tell me? (web credentials are only needed for the web source)
+python3 ragdoll.py --host 192.0.2.20 --list
+
+# the current inlet temperature, read over SNMP
+python3 ragdoll.py --host 192.0.2.20 --get
+
+# a line chart of the last day of inlet temperature from the web interface
+python3 ragdoll.py --host 192.0.2.10 --user <user> --pass <password> --last day --chart line
 ```
 
-- `--db` on its own uses `~/.local/share/ragdoll/ragdoll.db` (or `$XDG_DATA_HOME/ragdoll/ragdoll.db`);
-  `--db PATH` uses a database of your choosing. It is created on first use.
-- Storing is repeatable: a reading already in the database is skipped, so each run can safely pass its whole
-  history. The web source's full history (about 61,000 hourly samples) is stored on the first run and takes
-  around a second.
-- With `--raw`, readings are stored and the CSV is printed without drawing a chart, which suits a cron job.
-- Without `--db`, nothing is written to a database and the charts come from the cache as before.
+Credentials do not have to be typed each time: see [Credentials](#credentials).
 
-One table, `readings`, with one row per sample:
+## Sources and metrics
 
-| Column | Meaning |
+ragdoll reads from two sources, chosen with `--source` (`gui` is accepted as another name for `web`):
+
+| Source | Metrics | How it works | History |
+|---|---|---|---|
+| `web` (default; also `gui`) | temperature | Logs in to the iDRAC web interface and downloads the temperature statistics CSV | Hourly history held by the iDRAC |
+| `snmp` | temperature, fan, power, voltage, health, network | Reads the current value from the Dell probe tables (and the standard interface counters) over SNMP v2c | Only the current value; each run appends a reading to the local cache, so history builds up over time |
+
+`--metric` chooses what to read (default `temperature`) and `--sensor` picks one sensor of that metric. Every metric
+except `temperature` needs `--source snmp`. The sensors the iDRAC offers are shown by [`--list`](#listing-sensors);
+unknown names are rejected with the ones that exist.
+
+| Metric | Unit | Default sensor | Example sensors (snmp) |
+|---|---|---|---|
+| `temperature` | °C | `inlet` | `inlet`, `exhaust`, `cpu1`, `cpu2` (the web source offers `inlet` only) |
+| `fan` | RPM | `fan1a` | `fan1a`, `fan1b`, `fan2a` ... `fan7b` |
+| `power` | W, A or Wh | `system-power` | `system-power`, `ps1-current`, `ps2-current`, `energy`, `peak-power`, `idle-power` ... |
+| `voltage` | V | `ps1-voltage` | `ps1-voltage`, `ps2-voltage` |
+| `health` | status code | `system` | `system`, `cpu1`, `dimm-a1`, `ps1`, `disk-0`, `vdisk-data`, `raid-battery` ... (41 on the test server) |
+| `network` | bytes per second | `bond0-in` | `bond0-in`, `bond0-out` |
+
+All the SNMP details below were checked against Dell's iDRAC MIB.
+
+### Power: energy and peaks
+
+Besides the supply currents (`ps1-current`, `ps2-current`, in amps) and `system-power` (watts), `power` reads the power
+usage table as extra sensors: `energy` (cumulative watt-hours since the date the iDRAC began counting), `peak-power`
+(watts) and `peak-current` (amps), the highest values seen, `idle-power` (the least the hardware can use),
+`max-power` (the most it can use), and `headroom` and `peak-headroom` (watts left under the power supply's limit, now
+and at the peak).
+
+### Voltage
+
+`voltage` reads the power supply input voltages (`ps1-voltage`, `ps2-voltage`). The iDRAC also has about 30 on/off
+power-good checks that return no number; they are not listed.
+
+### Health
+
+`health` records a status code per component, so changes can be charted or noticed over time: the whole system
+(`system`), CPUs, each memory module (`dimm-a1` ...), power supplies, chassis intrusion, batteries, the RAID
+controller and its battery, each disk (`disk-0` ...) and virtual disk (`vdisk-data`), and the fan and power
+redundancy (`fan-redundancy`, `ps-redundancy`).
+
+| Code | Component status | Redundancy (`fan-redundancy`, `ps-redundancy`) |
+|---|---|---|
+| 1 | other | other |
+| 2 | unknown | unknown |
+| 3 | **ok** | **full** |
+| 4 | non-critical | degraded |
+| 5 | critical | lost |
+| 6 | non-recoverable | not redundant |
+| 7 | | redundancy offline |
+
+A chart of a healthy component is a flat line at 3. The iDRAC's disk, virtual disk and battery *state* values use
+different numbering and are not used; the status of each of those is.
+
+### Network traffic
+
+`network` reads the byte counters of the iDRAC's own network interfaces (`bond0-in`, `bond0-out`; loopback is left
+out). A counter only ever grows, so ragdoll stores the counter and shows the **rate in bytes per second** between
+consecutive readings. That needs at least two readings, so the first run explains what to do, and later runs (or a
+cron job) fill it in. A reading lower than the one before, which happens when the iDRAC restarts, is skipped. This is
+traffic on the management port, not on the server's own network ports. The `--raw` flag shows the stored counter.
+
+### Limits
+
+Temperature, fan and some power probes have warning and critical limits. Every poll over SNMP saves them next to the
+cache. They are shown by `--list`, and `--limits` draws them on a [chart](#charts). The limits belong to the host and
+sensor, not the source, so a chart from the web source of the same sensor can use limits saved by an SNMP poll.
+
+## Listing sensors
+
+`--list` prints every sensor of every source and metric (`--list sensors` is the same thing, spelt out). The credentials
+of a source are used if you have them; a source that cannot be reached or needs credentials you haven't given is
+reported on stderr and skipped. A source or metric after `--list` narrows it (`--list snmp`, `--list fan`), and so do
+`--source` and `--metric`.
+
+```
+$ python3 ragdoll.py --host 192.0.2.20 --list temperature
+SOURCE  METRIC       SENSOR   UNIT  VALUE  LIMITS                  KEY
+snmp    temperature  cpu1     °C       23  warn 8..82 crit 3..87   1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.3
+snmp    temperature  cpu2     °C       26  warn 8..82 crit 3..87   1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.4
+snmp    temperature  exhaust  °C       26  warn 0..70 crit 0..75   1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.2
+snmp    temperature  inlet    °C       16  warn 3..42 crit -7..47  1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.1
+web     temperature  inlet    °C       14  warn 3..42 crit -7..47  iDRAC.Embedded.1#Inlet.1#ThermalHistory
+```
+
+- **UNIT** is what the values are measured in: `°C`, `RPM`, `V`, `W`, `A`, `Wh`, `B/s`, or `code` for a `health`
+  status.
+- **VALUE** is the current reading from SNMP. The web source cannot give one without fetching its whole history, so
+  its row shows the newest reading already in the cache (or `-` if nothing is cached). `network` counters show `-`,
+  because they only mean something as a rate between two readings.
+- **LIMITS** are `lower..upper` pairs of warning and critical limits, with `-` where a limit is missing (a fan has only
+  lower limits). Sensors without limits show `-`. The web row uses limits saved by an earlier SNMP poll of the same
+  sensor.
+- **KEY** is the iDRAC's own identifier for the sensor.
+
+`--output` changes the format, so the listing can be exported. The default is plain `text`, as above.
+
+| `--output` | What you get |
 |---|---|
-| `host`, `source`, `metric`, `sensor` | what was read, for example `192.0.2.20`, `snmp`, `temperature`, `cpu1` |
-| `time` | Unix time of the sample (integer seconds since 1970-01-01 UTC) |
-| `average`, `peak` | the reading in the unit for that metric (°C, RPM, W or A); identical for snmp |
+| `text` | the aligned plain text above (the default) |
+| `table` | a bordered table, using `terminaltables` |
+| `csv` | CSV, one row per sensor |
+| `xlsx`, `xls` | a spreadsheet with one `Sensors` sheet, named with `--file` or, without it, `<host>_sensors[_<source>][_<metric>]` in the current directory |
 
-The primary key is `(host, source, metric, sensor, time)`. Query it with any SQLite tool, for example:
+`chart` and `raw` are for readings and are rejected with `--list`, and `--output text` is only for `--list`.
 
-```
-sqlite3 ~/.local/share/ragdoll/ragdoll.db \
-  "SELECT time, average FROM readings WHERE sensor = 'cpu1' ORDER BY time DESC LIMIT 10"
-```
-
-## Table output
-
-`--output table` prints the selected readings as a table, oldest first, instead of drawing a chart. It uses the plain
-ASCII style of `terminaltables`, so it also works when piped or redirected.
+CSV and the spreadsheets are meant for other programs, so they keep numbers as numbers and give the four limits columns
+of their own (`lower_critical`, `lower_warning`, `upper_warning`, `upper_critical`) instead of the `warn ..` text.
+A missing value or limit is an empty cell.
 
 ```
-python3 ragdoll.py --host 192.0.2.20 --source snmp --metric fan --sensor fan1a --last 5 --output table
-```
-```
-192.0.2.20 Fan1A Speed (Average / Peak) [AEDT]
-+---------------------+---------------+------------+
-| Time (AEDT)         | Average (RPM) | Peak (RPM) |
-+---------------------+---------------+------------+
-| 2026-10-06 15:53:05 |          3840 |       3840 |
-+---------------------+---------------+------------+
+$ python3 ragdoll.py --host 192.0.2.20 --list temperature --output csv
+source,metric,sensor,unit,value,lower_critical,lower_warning,upper_warning,upper_critical,key
+snmp,temperature,cpu1,°C,23,3,8,82,87,1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.3
+snmp,temperature,cpu2,°C,26,3,8,82,87,1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.4
+snmp,temperature,exhaust,°C,26,0,0,70,75,1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.2
+snmp,temperature,inlet,°C,16,-7,3,42,47,1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.1
+web,temperature,inlet,°C,14,-7,3,42,47,iDRAC.Embedded.1#Inlet.1#ThermalHistory
+
+$ python3 ragdoll.py --host 192.0.2.20 --source snmp --metric fan --list --output xlsx
+Wrote 14 sensors to 192.0.2.20_sensors_snmp_fan.xlsx
 ```
 
-- The time column is in local time, or the zone given with `--tz` or `--utc`; the zone name is in the header.
-- The unit follows the metric (°C, RPM, W or A).
-- `--last` chooses how many rows (a row count or a period), as for charts. The default is 10 rows.
-- `--module`, `--chart`, `--width` and `--height` have no effect on a table.
+## Getting a current value
 
-## CSV output
-
-Two CSV outputs print the selected readings, oldest first. `--last` chooses how many (default 10; `--last 0`
-means every reading).
-
-- **`--output csv`** is for spreadsheets, databases and scripts. Each row says what it is, so files from different
-  hosts or sensors can be joined. The time is ISO 8601 with its UTC offset, in local time or the zone from `--tz` or
-  `--utc`.
-- **`--output raw`** is the form ragdoll itself stores: `Average,Peak,Time`, with UTC times ending in `Z`. It is
-  what is kept in the cache.
+`--get` polls one SNMP sensor now and prints its current value and unit, which is handy for a quick look or a script.
+It uses `--source snmp` unless told otherwise, and `--metric` and `--sensor` choose the sensor (the defaults are
+`temperature` and `inlet`, or the default sensor of the metric).
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 3 --output csv
-time,host,source,metric,sensor,average,peak,unit
-2026-10-06T04:00:31+11:00,192.0.2.20,web,temperature,inlet,14,14,°C
-2026-10-06T05:00:31+11:00,192.0.2.20,web,temperature,inlet,14,14,°C
-2026-10-06T06:00:31+11:00,192.0.2.20,web,temperature,inlet,14,14,°C
+$ python3 ragdoll.py --host 192.0.2.20 --get
+16 °C
+$ python3 ragdoll.py --host 192.0.2.20 --metric fan --sensor fan1a --get
+3840 RPM
+$ python3 ragdoll.py --host 192.0.2.20 --metric power --sensor system-power --get
+112 W
+$ python3 ragdoll.py --host 192.0.2.20 --metric health --sensor system --get
+3 code
 ```
 
+- **Nothing is stored.** `--get` does not touch the cache or a database, even with `--db`. To record readings, poll
+  the sensor normally.
+- **In a script:** the output is the number, a space and the unit, so `awk '{print $1}'` gives the bare number:
+  `temp=$(python3 ragdoll.py --host 192.0.2.20 --get | awk '{print $1}')`. A failure prints a message on stderr and
+  exits with status 1.
+- **Counters:** a network counter has no value of its own, so `--metric network --get` reads it twice, 2 seconds apart,
+  and prints the rate in bytes per second (`2184.523 B/s`).
+- **Other formats:** `--output table|csv|xlsx|xls` shows the same one sensor as a row, with its unit, limits and key, as
+  `--list` would; `--file` names a spreadsheet. `--output text` is the default.
+- **Only SNMP:** the web source cannot give a live value without fetching its whole history, so `--source web` is
+  rejected. `--get` cannot be combined with `--list` or `--no-fetch`.
+
+## Charts
+
+`--output chart` is the default. A chart shows the selected readings, and the title names the host, the sensor and the
+time zone.
+
+- `--chart vertical|horizontal|stacked|histogram|line|scatter` (default `vertical`). `line` and `scatter` need plotext.
+  A line chart suits trends best because its scale fits the data; bar charts start at zero, so a small change between
+  readings is hard to see.
+- `--module plotext|termgraph` (default `plotext`). termgraph has no `line` or `scatter` chart, ignores `--height`, and
+  its `vertical` chart ignores `--width`.
+- `--width` (default 80) and `--height` (default 24) fit a standard terminal. One row is left free for the shell prompt.
+  plotext never draws wider than the terminal.
+- `--last` is how much to show: a row count (the default is `10`; `0` is everything) or a period such as `hour`, `day`,
+  `week`, `month`, `year`, `6h`, `2d` or `3 weeks`. A period is counted back from the newest reading in the data, not
+  from the local clock, and `month` is 30 days and `year` 365.
+- `--limits` draws the sensor's warning and critical limits on a plotext `line` or `scatter` chart, named in the legend.
+  The chart's scale widens to include them, so a reading well inside the limits looks flat. If no limits are saved
+  (poll the sensor over SNMP first), or the chart is not a plotext line or scatter chart, it says so on stderr.
+
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 3 --output raw
-Average,Peak,Time
-14,14,2026-10-05T17:00:31Z
-14,14,2026-10-05T18:00:31Z
-14,14,2026-10-05T19:00:31Z
+python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor inlet --last day --chart line --limits
 ```
+
+## Other outputs
+
+`--output` chooses what is produced from the selected readings (`--last` chooses how many; the default is 10 rows).
+`--module`, `--chart`, `--width` and `--height` apply to `chart` only.
+
+| `--output` | What you get |
+|---|---|
+| `chart` | a terminal chart (the default) |
+| `table` | a table, oldest first |
+| `csv` | CSV for spreadsheets, databases and scripts |
+| `raw` | CSV in the form ragdoll stores |
+| `xlsx`, `xls` | a spreadsheet, named with `--file` |
+
+### Table
+
+`--output table` uses the plain ASCII style of `terminaltables`, so it also works when piped or redirected. The time
+column is in local time, or the zone given with `--tz` or `--utc`, and the zone name is in the header.
+
+### CSV
+
+- **`--output csv`** gives each row everything that identifies it, so files from different hosts or sensors can be
+  joined: `time,host,source,metric,sensor,average,peak,unit`. The time is ISO 8601 with its UTC offset, in local time
+  or the zone from `--tz` or `--utc`.
+- **`--output raw`** is the form ragdoll itself stores: `Average,Peak,Time`, with UTC times ending in `Z`. It is what
+  is kept in the cache.
 
 `--output raw` is not the same as the older `--raw` flag. `--raw` prints every stored reading, ignores `--last`, and
 exits before any other output is chosen; it is kept so existing scripts and cron jobs keep working. `--output raw`
 prints only the selected readings.
 
-## Spreadsheet output
+### Spreadsheets
 
-`--output xlsx` writes an Excel workbook, and `--output xls` writes the older Excel 97-2003 format. `--file` names the
-file; without it a name is made in the current directory.
+`--output xlsx` writes an Excel workbook, and `--output xls` writes the older Excel 97-2003 format.
 
 ```
 $ python3 ragdoll.py --host 192.0.2.20 --source gui --last week --output xlsx
@@ -202,23 +266,94 @@ Wrote 3 readings to inlet.xls
 - **File name:** `--file report` becomes `report.xlsx` (or `.xls`) if it has no extension. A name ending in the other
   spreadsheet extension is rejected, and `--file` with any other `--output` is an error. An existing file is
   overwritten.
-- **Automatic name:** `<host>_<source>_<metric>-<sensor>_last-<period>.<ext>`, where the period describes `--last`:
-  `last-10rows`, `last-all` (for `--last 0`), `last-2h`, `last-1d`, `last-1w`, `last-1mo` or `last-1y`. The metric and
-  sensor are included so different sensors do not overwrite each other.
+- **Automatic name:** without `--file`, `<host>_<source>_<metric>-<sensor>_last-<period>.<ext>` in the current
+  directory, where the period describes `--last`: `last-10rows`, `last-all` (for `--last 0`), `last-2h`, `last-1d`,
+  `last-1w`, `last-1mo` or `last-1y`. The metric and sensor are included so different sensors do not overwrite each
+  other. Add `*.xlsx` and `*.xls` to `.gitignore` if you run it inside a repository.
 - **Contents:** one sheet, `Readings`, with a bold heading row (frozen in `.xlsx`) and four columns: `Time (<zone>)`
   in the zone from `--tz`, `--utc` or local time, `Time (UTC)`, `Average (<unit>)` and `Peak (<unit>)`. Times are real
   Excel dates formatted `yyyy-mm-dd hh:mm:ss`, so they can be charted and sorted. Spreadsheets have no time zone
   type, which is why both times are given.
-- `--last` chooses how many readings, as for the other outputs (default 10; `--last 0` is every reading).
 - **`.xls` limit:** the old format allows 65,535 readings. More is refused with a message; use `.xlsx` or a smaller
   `--last`. `.xlsx` has no such limit in practice (the 25,747-row history of one iDRAC is a 490 KB file).
-- Automatically named files go in the current directory, so add `*.xlsx` and `*.xls` to `.gitignore` if you run it
-  inside a repository.
 
-## Charting without contacting the iDRAC
+## Time zones
 
-`--no-fetch` skips the fetch or SNMP poll and charts what is already stored. No credentials are needed and nothing
-is added to the cache or the database.
+Times from the two sources are in different clocks, so ragdoll converts everything to **UTC** when it reads or
+polls, and stores it that way: as ISO 8601 text ending in `Z` in the cache and `--output raw`, and as Unix
+timestamps in the database. Charts and tables convert back to your computer's local time, and the time zone name is
+shown in the title (for example `[AEDT]`).
+
+- `--tz ZONE` shows any named time zone instead, using the IANA names from your system's time zone database, for
+  example `--tz Australia/Sydney`, `--tz America/New_York` or `--tz Asia/Tokyo`. Daylight saving is applied, so the
+  same sample can show as `[EDT]` in summer and `[EST]` in winter.
+- `--utc` is the same as `--tz UTC`. The two cannot be combined.
+- `--tz` only changes how times are displayed. It is unrelated to `--tz-offset`, which says what time the iDRAC's own
+  clock shows, so that its CSV can be converted to UTC.
+
+Where the times come from:
+
+- **snmp:** the iDRAC does not report a time over SNMP, so each reading is stamped with this computer's clock at the
+  moment it was polled. Keep this computer's clock correct (for example with NTP).
+- **web:** the iDRAC's CSV uses the iDRAC's own wall clock with no time zone. ragdoll converts it to UTC using the
+  clock's offset from UTC, which it measures by comparing the iDRAC's clock (read through Redfish) with this
+  computer's clock, rounded to the nearest quarter hour. It does not trust the time zone configured on the iDRAC,
+  because an iDRAC can show UTC while set to another time zone. If Redfish is unavailable, or you want to override
+  the measurement, pass `--tz-offset` (for example `--tz-offset UTC`, `+10:00` or `-05:00`). Conversion happens when
+  the data is fetched, so the cached copy and the database are already in UTC.
+- Cache files and databases written by versions before 0.2.0 stored local or iDRAC times with no zone. They are not
+  read: an old cache is refetched or ignored, and an old database is refused with a message. Delete the database and
+  run again to rebuild it.
+
+## Storage
+
+### Cache
+
+Data is cached per host, source, metric and sensor, for example `<host>_snmp_fan-fan1a.csv`.
+
+- The location is `~/.cache/ragdoll` (or `$XDG_CACHE_HOME/ragdoll`), changed with `--cachedir` (`--cache-dir` also
+  works).
+- Web data is reused until it is `--max-age` seconds old (default 3600); `--refresh` forces a fetch.
+- If a fetch fails and a cache file exists, the cache is used and a warning is printed.
+- The snmp source polls on every run, and each poll adds one reading to its cache file.
+- Cache files hold sensor readings only, never credentials.
+
+### SQLite database
+
+`--db` keeps every reading in a SQLite database, using Python's built-in `sqlite3` module (nothing extra to install).
+Charts are then drawn from the database, so they include readings from every earlier run and from both the web source
+and snmp.
+
+```
+python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --db --chart line --last week
+python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --db /path/to/readings.db --raw
+```
+
+- `--db` on its own uses `~/.local/share/ragdoll/ragdoll.db` (or `$XDG_DATA_HOME/ragdoll/ragdoll.db`); `--db PATH`
+  uses a database of your choosing. It is created on first use. Without `--db`, nothing is written to a database.
+- Storing is repeatable: a reading already in the database is skipped, so each run can safely pass its whole history.
+  The web source's full history (about 61,000 hourly samples) is stored on the first run and takes around a second.
+- With `--raw`, readings are stored and the CSV is printed without drawing a chart, which suits a cron job.
+
+One table, `readings`, with one row per sample:
+
+| Column | Meaning |
+|---|---|
+| `host`, `source`, `metric`, `sensor` | what was read, for example `192.0.2.20`, `snmp`, `temperature`, `cpu1` |
+| `time` | Unix time of the sample (integer seconds since 1970-01-01 UTC) |
+| `average`, `peak` | the reading in the unit for that metric (°C, RPM, W, A, Wh, V or a status code); identical for snmp. For `network` the raw byte counter is stored, and rates are worked out when it is shown |
+
+The primary key is `(host, source, metric, sensor, time)`. Query it with any SQLite tool, for example:
+
+```
+sqlite3 ~/.local/share/ragdoll/ragdoll.db \
+  "SELECT time, average FROM readings WHERE sensor = 'cpu1' ORDER BY time DESC LIMIT 10"
+```
+
+### Charting without contacting the iDRAC
+
+`--no-fetch` skips the fetch or SNMP poll and shows what is already stored. No credentials are needed and nothing is
+added to the cache or the database.
 
 ```
 # from the database (with --db)
@@ -229,17 +364,21 @@ python3 ragdoll.py --host 192.0.2.10 --no-fetch --chart line --last month
 ```
 
 - With `--db` the readings come from the database; without it, from the cache file, ignoring `--max-age`.
-- With `--raw`, the stored readings are printed as CSV.
 - If nothing is stored for that host, source, metric and sensor, it says so and asks you to run once without
   `--no-fetch`.
-- It cannot be combined with `--list`, `--save-credentials` or `--refresh`, which all need to contact the iDRAC.
-- Sensor names cannot be checked against the iDRAC in this mode, so a misspelt sensor is reported as having no
+- It cannot be combined with `--list`, `--get`, `--save-credentials` or `--refresh`, which all need to contact the
+  iDRAC. Sensor names cannot be checked against the iDRAC in this mode, so a misspelt sensor is reported as having no
   stored readings.
 
-## Saving credentials
+## Credentials
 
-Credentials can be kept in the operating system's keyring (Secret Service on Linux, Keychain on macOS,
-Credential Manager on Windows) through the `keyring` module, so they never appear on the command line or in shell history.
+No credential is stored in the script. The web source takes `--user` and `--pass` (also spelt `--username` and
+`--password`); the snmp source takes `--community`. A missing credential is looked up in this order: command-line
+flag, environment variable (`IDRAC_USER`, `IDRAC_PASS`, `IDRAC_COMMUNITY`), the OS keyring, and finally a password
+prompt (web only, when `--user` is known). With no community found, the standard read-only SNMP default is used.
+
+They can be kept in the operating system's keyring (Secret Service on Linux, Keychain on macOS, Credential Manager on
+Windows) through the `keyring` module, so they never appear on the command line or in shell history:
 
 ```
 # log in once and save; credentials are only saved if the login succeeds
@@ -252,92 +391,68 @@ python3 ragdoll.py --host 192.0.2.10 --last week --chart line
 python3 ragdoll.py --host 192.0.2.10 --forget-credentials
 ```
 
-- Entries are stored per host, under the service name `ragdoll:<host>`.
-- If you give `--user` without a password, you are prompted for it.
+- Entries are stored per host, under the service name `ragdoll:<host>`. `--save-credentials` saves for `--source`, or
+  for the source named after `--list`, otherwise for `web`.
 - On a machine without a keyring (a headless server or a cron job), use the `IDRAC_USER`, `IDRAC_PASS` and
   `IDRAC_COMMUNITY` environment variables instead, for example loaded from a file with mode 600.
-- Cached data files in `~/.cache/ragdoll` contain sensor readings only, never credentials.
+- A password given with `--pass` is visible to other users in the process list and lands in your shell history. Put a
+  space before the command if your shell ignores space-prefixed commands, pass it from an environment variable
+  (`--pass "$IDRAC_PASS"`), or use the keyring.
+- The iDRAC certificate is not verified by default, because they are usually self-signed; `--secure` turns
+  verification on.
 
-## Examples
+## Running regularly
 
-List the sensors on an iDRAC:
-
-```
-python3 ragdoll.py --host 192.0.2.10 --user <user> --pass <password> --list
-python3 ragdoll.py --host 192.0.2.20 --community <community> --list snmp
-python3 ragdoll.py --host 192.0.2.20 --community <community> --list fan
-```
-
-Line chart of the last week of inlet temperature from the web interface:
+SNMP gives only the current value, so history builds up as readings are collected. Run ragdoll periodically with
+`--raw`, which takes a reading without drawing a chart, for example from cron every 10 minutes (one entry per sensor
+you care about, since each metric and sensor has its own cache file):
 
 ```
-python3 ragdoll.py --host 192.0.2.10 --user <user> --pass <password> --last week --chart line
+*/10 * * * * python3 /path/to/ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --raw >/dev/null
 ```
 
-Last 12 samples as horizontal bars using termgraph:
+Add `--db` to keep the readings in a SQLite database as well. Once there are enough readings, a chart shows how the
+sensor changed:
 
 ```
-python3 ragdoll.py --host 192.0.2.10 --user <user> --pass <password> --last 12 --module termgraph --chart horizontal
+python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --chart line --last day
 ```
 
-List the fan and power sensors, then chart them:
+The first run shows a single point. For a quick look at the latest readings as bars, use `--last 12 --chart
+horizontal`; for just the current value, use [`--get`](#getting-a-current-value).
 
-```
-python3 ragdoll.py --host 192.0.2.20 --source snmp --community <community> --metric fan --list
-python3 ragdoll.py --host 192.0.2.20 --source snmp --community <community> --metric fan --sensor fan1a --chart line
-python3 ragdoll.py --host 192.0.2.20 --source snmp --community <community> --metric power --sensor system-power --chart line
-```
+## Option reference
 
-### Chart CPU temperatures
-
-CPU temperatures are only available over SNMP; the web source offers `inlet` only.
-
-```
-python3 ragdoll.py --host 192.0.2.20 --source snmp --community <community> --metric temperature --sensor cpu1 --chart line --last day
-```
-
-- `--metric temperature` is the default, so it can be left out.
-- `--sensor cpu1` selects the CPU1 probe. Use `cpu2` for the second CPU, and `--list` to see every sensor.
-- Leave out `--community` if the host uses the standard default, or save it once with `--save-credentials`.
-- SNMP returns only the current value. Each run adds one reading to the cache (`~/.cache/ragdoll`), and the chart
-  shows what has been collected so far, so the first run shows a single point.
-
-To build up history, run it periodically with `--raw`, which takes a reading without drawing a chart, for example
-from cron every 10 minutes:
-
-```
-*/10 * * * * python3 /path/to/ragdoll.py --host 192.0.2.20 --source snmp --community <community> --sensor cpu1 --raw >/dev/null
-```
-
-Once there are enough readings, the `--chart line --last day` command above shows how CPU1 changed over the day.
-For a quick look at the latest readings as bars, use `--last 12 --chart horizontal`.
-
-Avoid leaving the password in your shell history: put a space before the command if your shell ignores
-space-prefixed commands, or pass it from an environment variable, e.g. `--pass "$IDRAC_PASS"`.
+| Option | What it does |
+|---|---|
+| `--host HOST` | the iDRAC's address (required) |
+| `--source web\|snmp` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get` |
+| `--metric M` | `temperature`, `fan`, `power`, `voltage`, `health` or `network`; default `temperature` |
+| `--sensor S` | which sensor of the metric; the default depends on the metric |
+| `--list [sensors\|SOURCE\|METRIC]` | list the sensors and exit |
+| `--get` | print one sensor's current value over SNMP and exit |
+| `--user`/`--username`, `--pass`/`--password` | web credentials |
+| `--community` | SNMP v2c community string |
+| `--save-credentials`, `--forget-credentials` | keep or remove this host's credentials in the OS keyring |
+| `--secure` | verify the iDRAC's TLS certificate |
+| `--output O` | `chart`, `table`, `raw`, `csv`, `xlsx` or `xls`; with `--list` or `--get`, `text`, `table`, `csv`, `xlsx` or `xls` |
+| `--file FILE` | the spreadsheet to write for `xlsx` and `xls` |
+| `--chart C`, `--module M`, `--width W`, `--height H`, `--limits` | chart type, graphing module, size, and limit lines |
+| `--last N\|PERIOD` | how many readings to show (default 10 rows) |
+| `--tz ZONE`, `--utc` | the time zone for displayed times |
+| `--tz-offset OFFSET` | the web source's clock offset from UTC, instead of measuring it |
+| `--cachedir DIR`, `--max-age SECONDS`, `--refresh` | the cache directory, how long web data stays fresh, and forcing a fetch |
+| `--db [PATH]` | also store readings in a SQLite database and use it for charts |
+| `--no-fetch` | show what is already stored without contacting the iDRAC |
+| `--raw` | print every stored reading as CSV and exit (the older flag; see [CSV](#csv)) |
+| `--version`, `--help` | version and full option help |
 
 ## Example output
 
 Real output, with the iDRAC's address replaced by a documentation address. Times are in the machine's local time
 zone (AEDT here), which is named in each title.
 
-### List the sensors
-
-`--list temperature` shows every temperature sensor from every source. This iDRAC offers the same inlet sensor
-through the web interface and SNMP, and the extra sensors only through SNMP.
-
-```
-$ python3 ragdoll.py --host 192.0.2.20 --list temperature
-SOURCE  METRIC       SENSOR   KEY
-snmp    temperature  cpu1     1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.3
-snmp    temperature  cpu2     1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.4
-snmp    temperature  exhaust  1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.2
-snmp    temperature  inlet    1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.1
-web     temperature  inlet    iDRAC.Embedded.1#Inlet.1#ThermalHistory
-```
-
 ### Line chart
-
-A line chart suits trends best, because its scale fits the data.
 
 ```
 $ python3 ragdoll.py --host 192.0.2.20 --source gui --last day --chart line --height 16
@@ -360,9 +475,6 @@ $ python3 ragdoll.py --host 192.0.2.20 --source gui --last day --chart line --he
 
 ### Bar charts
 
-The default chart is `vertical`. Bar charts start their scale at zero, so a small change between readings is hard to
-see; use `line` for that. termgraph's `horizontal` bars show the timestamp and value on each line.
-
 ```
 $ python3 ragdoll.py --host 192.0.2.20 --source gui --last 12 --chart vertical --height 14
                192.0.2.20 Inlet Temperature (Average / Peak) [AEDT]
@@ -379,6 +491,8 @@ $ python3 ragdoll.py --host 192.0.2.20 --source gui --last 12 --chart vertical -
        Oct 05 20:00:31         Oct 06 00:00:31             Oct 06 05:00:31
 °C
 ```
+
+termgraph's `horizontal` bars show the timestamp and value on each line:
 
 ```
 $ python3 ragdoll.py --host 192.0.2.20 --source gui --last 4 --chart horizontal --module termgraph
@@ -425,11 +539,21 @@ $ python3 ragdoll.py --host 192.0.2.20 --source snmp --metric fan --sensor fan1a
 +---------------------+---------------+------------+
 ```
 
-### Raw CSV
-
-`--raw` prints all the readings in the cache format, with UTC times. Only the first rows are shown here.
+### CSV
 
 ```
+$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 3 --output csv
+time,host,source,metric,sensor,average,peak,unit
+2026-10-06T04:00:31+11:00,192.0.2.20,web,temperature,inlet,14,14,°C
+2026-10-06T05:00:31+11:00,192.0.2.20,web,temperature,inlet,14,14,°C
+2026-10-06T06:00:31+11:00,192.0.2.20,web,temperature,inlet,14,14,°C
+
+$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 3 --output raw
+Average,Peak,Time
+14,14,2026-10-05T17:00:31Z
+14,14,2026-10-05T18:00:31Z
+14,14,2026-10-05T19:00:31Z
+
 $ python3 ragdoll.py --host 192.0.2.20 --raw | head -4
 Average,Peak,Time
 22,23,2016-10-14T15:59:16Z
@@ -437,26 +561,56 @@ Average,Peak,Time
 20,21,2016-10-17T14:59:19Z
 ```
 
+The last command is the older `--raw` flag, which prints every stored reading; only the first rows are shown.
+
+### Sensor listing as a table
+
+```
+$ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
++--------+-------------+---------+------+-------+------------------------+------------------------------------------+
+| SOURCE | METRIC      | SENSOR  | UNIT | VALUE | LIMITS                 | KEY                                      |
++--------+-------------+---------+------+-------+------------------------+------------------------------------------+
+| snmp   | temperature | cpu1    | °C   |    23 | warn 8..82 crit 3..87  | 1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.3 |
+| snmp   | temperature | cpu2    | °C   |    26 | warn 8..82 crit 3..87  | 1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.4 |
+| snmp   | temperature | exhaust | °C   |    26 | warn 0..70 crit 0..75  | 1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.2 |
+| snmp   | temperature | inlet   | °C   |    16 | warn 3..42 crit -7..47 | 1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.1 |
+| web    | temperature | inlet   | °C   |    14 | warn 3..42 crit -7..47 | iDRAC.Embedded.1#Inlet.1#ThermalHistory  |
++--------+-------------+---------+------+-------+------------------------+------------------------------------------+
+```
+
 ## Notes
 
 - The iDRAC writes `-128` for both Average and Peak when a sample has no reading (on one iDRAC, nearly half of its
-  history). These rows are skipped everywhere: they are not charted, printed by `--raw`, cached or stored, and a
-  database written by an earlier version that holds them is cleaned the next time `--db` stores readings: the
-  rows are deleted and the file is compacted, which frees the space they used.
-- Units are °C, RPM, watts and amps. The iDRAC reports temperatures and power supply currents in tenths, and these are converted.
-- Each metric and sensor has its own cache file, so build up history with one cron entry per sensor you care about.
+  history). These rows are skipped everywhere: they are not charted, printed, cached or stored, and a database written
+  by an earlier version that holds them is cleaned the next time `--db` stores readings: the rows are deleted and the
+  file is compacted, which frees the space they used.
+- The iDRAC reports temperatures and power supply currents in tenths, and voltages in millivolts; ragdoll converts
+  them, so values are always in the units shown (°C, RPM, W, A, Wh, V, B/s or a status code).
 - The "Average" and "Peak" series are identical for SNMP, since each reading is a single value.
-- termgraph does not scale a chart whose values are all identical (common for fans and power on an idle server), so for those it draws a full-width bar and shows the value in the label. plotext has no such limitation.
-- The iDRAC web interface ignores unknown sensor names and returns inlet data, which is why sensor names are checked against the list first.
-- Sources are registered in the `SOURCES` table in `ragdoll.py`; adding another (for example Redfish) means providing a `list` and a `fetch` function.
+- The web history can lag well behind real time: one iDRAC's newest sample was about 9.5 hours old. Use SNMP for
+  current values.
+- termgraph does not scale a chart whose values are all identical (common for fans and power on an idle server), so for
+  those it draws a full-width bar and shows the value in the label. plotext has no such limitation.
+- The iDRAC web interface ignores unknown sensor names and returns inlet data, which is why sensor names are checked
+  against the list first.
+- Sources are registered in the `SOURCES` table in `ragdoll.py`, and outputs in `OUTPUTS`; adding a source (for
+  example Redfish) means providing a `list` and a `fetch` function. See `CLAUDE.md` and `TODO.md` for the design notes
+  and planned work.
+
+## Version
+
+Current version: **0.3.5**. Print it with `python3 ragdoll.py --version`.
+
+Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
+is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 ## License
 
 This work is licensed under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
 License](https://creativecommons.org/licenses/by-nc-sa/4.0/) (CC BY-NC-SA 4.0). The full text is in [LICENSE](LICENSE).
 
-In short: you may share and adapt it with attribution, not for commercial purposes, and you must distribute
-your changes under the same license.
+In short: you may share and adapt it with attribution, not for commercial purposes, and you must distribute your
+changes under the same license.
 
 ## Help Support Development
 

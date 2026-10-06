@@ -8,10 +8,108 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.3.0 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.3.5 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+### Changed
+- The README is restructured. Features are grouped by task (sources and metrics, listing, getting a value, charts,
+  other outputs, time zones, storage, credentials, running regularly) instead of in the order they were added, and
+  the duplicated examples are merged into one "Example output" section.
+- New in the README: a table of contents, a quick start, an option reference table, the default sensor of each
+  metric, and the supported Python version (written and tested with 3.14; at least 3.9 is needed for `zoneinfo`,
+  older versions untried).
+- Corrected statements that had gone stale: the intro now lists all six metrics, and the units note includes volts,
+  watt-hours and bytes per second.
+
+## [0.3.5] - 2026-10-06
+
+### Added
+- `--get` polls one snmp sensor and prints its current value and unit (`16 °C`, `3840 RPM`, `112 W`), for quick
+  checks and scripts. It defaults to `--source snmp`, and `--metric` and `--sensor` choose the sensor. Nothing is
+  stored, so the cache and any `--db` database are left alone.
+- For a counter metric (`network`) it reads twice, 2 seconds apart, and prints bytes per second.
+- `--output table|csv|xlsx|xls` shows the sensor as a one-row listing (with unit, limits and key); `--output text`
+  is the bare value and the default. `--file` names a spreadsheet.
+- `--get` is rejected with `--list`, `--no-fetch` and `--source web`, and an unknown sensor is reported with the
+  sensors that exist. A failure exits with status 1.
+
+### Fixed
+- Spreadsheet messages said "1 sensors"; they now say "1 sensor".
+
+## [0.3.4] - 2026-10-06
+
+### Added
+- `--list` accepts `--output text|table|csv|xlsx|xls`. `text`, the aligned plain text, is the default and is also
+  available by name. `table` uses `terminaltables`. `csv`, `xlsx` and `xls` keep numbers as numbers and split the
+  limits into four columns (`lower_critical`, `lower_warning`, `upper_warning`, `upper_critical`); a missing value is
+  an empty cell.
+- Spreadsheet listings use `--file`, or are named `<host>_sensors[_<source>][_<metric>]` in the current directory,
+  for example `192.0.2.20_sensors_snmp_fan.xlsx`.
+- `--output chart` and `--output raw` are rejected with `--list`, and `--output text` without `--list`.
+
+### Changed
+- `--output` no longer has a fixed default: it is `chart` for readings and `text` for `--list`.
+
+### Fixed
+- Writing a sensor listing to `.xlsx` or `.xls` failed with a traceback when every cell in a column was empty (for
+  example the upper limits of the fans). The column width is now worked out safely.
+
+## [0.3.3] - 2026-10-06
+
+### Added
+- The `--list` table has three new columns: `UNIT` (°C, RPM, V, W, A, Wh, B/s or code), `VALUE` (the current reading)
+  and `LIMITS` (`warn lower..upper crit lower..upper`, `-` where missing). The `KEY` column stays last. The `METRIC`
+  column was already there.
+- SNMP sensors take their value and limits from the poll that built the listing. The web source's row uses the newest
+  cached reading and the saved limits, or `-` when there are none, because a live value would need a full fetch.
+  `network` counters show `-`.
+- `list` functions of the sources now return a `Reading` (key, value, limits) for each sensor.
+- The README's "List the sensors" example shows the new columns.
+
+## [0.3.2] - 2026-10-06
+
+### Added
+- `--list sensors` lists every sensor of every source and metric with its source, in the same aligned table as
+  before (source, metric, sensor, key). It is the same as `--list` on its own, now spelt out; the help text and error
+  message name it, and the value is case-insensitive.
+
+### Changed
+- The `--list` help text and its error message now name all six metrics.
+
+## [0.3.1] - 2026-10-06
+
+### Added
+- `--metric voltage`: the power supply input voltages (`ps1-voltage`, `ps2-voltage`), in volts. The discrete
+  power-good probes in the same table return no reading and are skipped.
+- `--metric health`: a status code per component (system, CPUs, memory modules, power supplies, intrusion,
+  batteries, RAID controller and battery, disks, virtual disks, fan and power redundancy), 41 sensors on the test
+  server, so state changes can be charted. Only the *status* columns are used, because the disk, virtual disk and
+  battery *state* columns are numbered differently.
+- `--metric network`: byte counters of the iDRAC's own interfaces (IF-MIB `ifHCInOctets` and `ifHCOutOctets`),
+  shown as bytes per second between readings. The counter is what is stored; a counter that goes down (a restart) is
+  skipped, and one reading explains that two are needed.
+- New `power` sensors from the power usage table: `energy` (Wh), `peak-power`, `peak-current`, `idle-power`,
+  `max-power`, `headroom` and `peak-headroom`.
+- `--limits` draws a sensor's warning and critical limits on plotext `line` and `scatter` charts. Each SNMP poll saves
+  them next to the cache (`<host>_<metric>-<sensor>.limits.json`), shared by sources.
+
+### Changed
+- Each metric now has its own reader, so metrics need not be a single probe table. An SNMP poll shares one engine
+  and connection between its walks instead of creating one per walk, which made a 41-sensor health poll take 1.8 s
+  instead of 4.5 s.
+- `--list` shows the new sensors, and the sensor listing keys use the full row index.
+- The `--metric` help and README list the new metrics.
+
+### Fixed
+- Readings were formatted with six significant digits, so a value of seven digits or more would have been stored
+  in scientific notation and lost precision (for example the 2,224,483,828 byte counter, or an energy total over
+  999,999 Wh). Values are now written in full.
+
+### Added
+- "More SNMP telemetry" section in `TODO.md`: voltage, threshold lines, health status, network traffic, energy and
+  peak power, amperage units from the probe type, and the event log, with their OIDs confirmed against the Dell iDRAC MIB.
 
 ## [0.3.0] - 2026-10-06
 

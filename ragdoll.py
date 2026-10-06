@@ -10,12 +10,14 @@ License: Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
 import argparse
 import asyncio
 import calendar
+import collections
 import contextlib
 import copy
 import csv
 import datetime as dt
 import getpass
 import io
+import json
 import os
 import re
 import shutil
@@ -30,14 +32,28 @@ from pathlib import Path
 import requests
 import urllib3
 
-__version__ = "0.3.0"
+__version__ = "0.3.5"
 
 
 class SourceError(Exception):
     """A data source could not provide what was asked for."""
 
 
-SNMP_COL_READING, SNMP_COL_NAME = 6, 8  # same layout in all the Dell probe tables below
+DELL = "1.3.6.1.4.1.674.10892.5"  # Dell's iDRAC MIB (IDRAC-MIB-SMIv2)
+IF_XTABLE = "1.3.6.1.2.1.31.1.1.1"  # IF-MIB ifXTable: .1 ifName, .6 ifHCInOctets, .10 ifHCOutOctets
+# Columns shared by the Dell probe tables (temperature, voltage, amperage and cooling devices)
+SNMP_COL_READING, SNMP_COL_NAME = 6, 8
+SNMP_COL_LIMITS = {"upper_critical": 10, "upper_warning": 11, "lower_warning": 12, "lower_critical": 13}
+
+
+class Reading(collections.namedtuple("Reading", "key value limits")):
+    """One sensor from an SNMP poll: the OID it was read from, its value, and its limits (dict or None)."""
+
+
+def num(value):
+    """Format a reading without losing precision: 23.0 -> '23', 0.2 -> '0.2', 2224015267.0 -> '2224015267'."""
+    value = float(value)
+    return str(int(value)) if value.is_integer() else repr(value)
 
 
 def _strip(name, *patterns):
@@ -53,22 +69,66 @@ def _power_name(name):
     return _strip(name, r" \d+$")  # "PS1 Current 1" -> "ps1-current"
 
 
-# Per-metric SNMP details. divisor converts the raw integer to the unit; label ends the chart title.
-# Power mixes units: power supply probes report tenths of an amp, system consumption is in watts.
+def _clean(name):
+    """'PERC H730P Mini (Embedded)' -> 'perc-h730p-mini'."""
+    return _strip(re.sub(r"\s*\(.*?\)", "", name))
+
+
+def _disk_name(name):
+    m = re.match(r"Disk (\d+) in Backplane", name)
+    return f"disk-{m.group(1)}" if m else _clean(name)
+
+
+# Rows of the power usage table (4.600.60) that become sensors of the power metric: column -> (sensor, divisor)
+POWER_USAGE = {7: ("energy", 1), 9: ("peak-power", 1), 12: ("peak-current", 10), 15: ("idle-power", 1),
+               16: ("max-power", 1), 20: ("headroom", 1), 21: ("peak-headroom", 1)}
+
+# Status columns of the components in the health metric: (table, name column, status column, name -> sensor).
+# Most use Dell's status codes (3 = ok); the two redundancy tables use full(3) degraded(4) lost(5) ...
+HEALTH_TABLES = [
+    (f"{DELL}.4.1100.32.1", 7, 5, lambda n: _strip(n, r" status$")),  # CPUs: cpu1, cpu2
+    (f"{DELL}.4.1100.50.1", 8, 5, lambda n: "dimm-" + _strip(n, r"^dimm\.socket\.")),  # memory: dimm-a1 ...
+    (f"{DELL}.4.600.12.1", 8, 5, lambda n: _strip(n, r" status$")),  # power supplies: ps1, ps2
+    (f"{DELL}.4.300.70.1", 8, 5, lambda n: _strip(n, r"^system board ")),  # chassis intrusion
+    (f"{DELL}.4.600.50.1", 7, 5, lambda n: _strip(n, r"^system board ")),  # batteries: cmos-battery ...
+    (f"{DELL}.4.700.10.1", 7, 5, lambda n: _strip(n, r"^system board ")),  # fan-redundancy
+    (f"{DELL}.4.600.10.1", 7, 5, lambda n: _strip(n, r"^system board ")),  # ps-redundancy
+    (f"{DELL}.5.1.20.130.4.1", 55, 24, _disk_name),  # physical disks: disk-0 ...
+    (f"{DELL}.5.1.20.140.1.1", 2, 20, lambda n: "vdisk-" + _strip(n)),  # virtual disks
+    (f"{DELL}.5.1.20.130.15.1", 21, 6, lambda n: "raid-battery"),
+    (f"{DELL}.5.1.20.130.1.1", 2, 38, _clean),  # storage controllers
+]
+
+
+def probe_unit(sensor):
+    return " A" if sensor.endswith("-current") else " Wh" if sensor == "energy" else " W"
+
+
+# Per-metric details. read(args) -> {sensor: Reading}; unit(sensor) is shown in titles and headings; label ends the
+# chart title; counter=True means the stored values are ever-growing counters that outputs turn into rates.
+# Dell reports temperatures and power supply currents in tenths, voltages in millivolts, fans in RPM and watts as is.
 METRICS = {
     "temperature": {
-        "table": "1.3.6.1.4.1.674.10892.5.4.700.20.1", "label": "Temperature", "default": "inlet",
-        "short": lambda n: _strip(n, r"^system board ", r" temp(erature)?$"),
-        "divisor": lambda sensor: 10, "unit": lambda sensor: "°C"},
+        "label": "Temperature", "default": "inlet", "unit": lambda sensor: "°C",
+        "read": lambda args: read_probe_table(
+            args, f"{DELL}.4.700.20.1", lambda n: _strip(n, r"^system board ", r" temp(erature)?$"), lambda s: 10)},
     "fan": {
-        "table": "1.3.6.1.4.1.674.10892.5.4.700.12.1", "label": "Speed", "default": "fan1a",
-        "short": lambda n: _strip(n, r"^system board "),
-        "divisor": lambda sensor: 1, "unit": lambda sensor: " RPM"},
+        "label": "Speed", "default": "fan1a", "unit": lambda sensor: " RPM",
+        "read": lambda args: read_probe_table(
+            args, f"{DELL}.4.700.12.1", lambda n: _strip(n, r"^system board "), lambda s: 1)},
     "power": {
-        "table": "1.3.6.1.4.1.674.10892.5.4.600.30.1", "label": "", "default": "system-power",
-        "short": _power_name,
-        "divisor": lambda sensor: 10 if sensor.endswith("-current") else 1,
-        "unit": lambda sensor: " A" if sensor.endswith("-current") else " W"},
+        "label": "", "default": "system-power", "unit": probe_unit,
+        "read": lambda args: read_power(args)},
+    "voltage": {
+        "label": "", "default": "ps1-voltage", "unit": lambda sensor: " V",
+        "read": lambda args: read_probe_table(
+            args, f"{DELL}.4.600.20.1", lambda n: _strip(n, r" \d+$"), lambda s: 1000)},
+    "health": {
+        "label": "Status", "default": "system", "unit": lambda sensor: " code",
+        "read": lambda args: read_health(args)},
+    "network": {
+        "label": "Traffic", "default": "bond0-in", "unit": lambda sensor: " B/s", "counter": True,
+        "read": lambda args: read_network(args)},
 }
 METRIC_NAMES = tuple(METRICS)
 URL_TEMPLATE = "https://{host}/sysmgmt/2012/server/temperature/statistics/{sensor}?format=csv"
@@ -143,6 +203,20 @@ def parse_last(value):
     n = int(m.group(1) or 1)
     unit = UNIT_NAMES.get(m.group(2), m.group(2))
     return ("seconds", n * UNITS[unit])
+
+
+def to_rates(rows):
+    """Turn cumulative counter readings into bytes (or units) per second between consecutive readings.
+
+    An interval is dropped if the counter went down (the device restarted) or no time passed. The first reading
+    has nothing before it, so n readings give at most n - 1 rates.
+    """
+    out = []
+    for (t0, v0, _), (t1, v1, _) in zip(rows, rows[1:]):
+        if t1 > t0 and v1 >= v0:
+            rate = round((v1 - v0) / (t1 - t0), 3)
+            out.append((t1, rate, rate))
+    return out
 
 
 def select_last(data, last):
@@ -286,7 +360,7 @@ def load_rows(args):
 
 
 def to_csv(rows):
-    return "Average,Peak,Time\n" + "".join(f"{avg:g},{peak:g},{epoch_to_csv(t)}\n" for t, avg, peak in rows)
+    return "Average,Peak,Time\n" + "".join(f"{num(avg)},{num(peak)},{epoch_to_csv(t)}\n" for t, avg, peak in rows)
 
 
 def read_cache(path):
@@ -369,12 +443,18 @@ def parse_args():
                         "snmp reads the current value and builds history in the cache (gui is an alias for web; default: web; "
                         "with --list, all sources)")
     p.add_argument("--metric", choices=METRIC_NAMES,
-                   help="what to read: temperature, fan (RPM) or power (watts and amps); "
-                        "fan and power need --source snmp (default: temperature; with --list, all metrics)")
+                   help="what to read: temperature, fan (RPM), power (W, A, Wh), voltage (V), health (status "
+                        "codes) or network (bytes per second); all but temperature need --source snmp "
+                        "(default: temperature; with --list, all metrics)")
     p.add_argument("--sensor", help="sensor to graph, see --list (default: inlet, fan1a or system-power depending on --metric)")
-    p.add_argument("--list", nargs="?", const="all", metavar="SOURCE|METRIC",
-                   help="list the available sensors and exit: every sensor from every source by default, "
-                        "or only one source (web, snmp) or metric (temperature, fan, power); "
+    p.add_argument("--get", action="store_true",
+                   help="poll one snmp sensor now and print its current value, for example 16 °C; nothing is "
+                        "stored. Uses --source snmp by default, with --metric and --sensor choosing the sensor "
+                        "(network counters are sampled twice, 2 seconds apart, to give bytes per second)")
+    p.add_argument("--list", nargs="?", const="all", metavar="sensors|SOURCE|METRIC",
+                   help="list the available sensors and exit: sensors (the default) lists every sensor of every "
+                        "source and metric, with its source; or give a source (web, snmp) or a metric "
+                        "(temperature, fan, power, voltage, health, network) to list only those; "
                         "--source and --metric also narrow the listing")
     p.add_argument("--secure", action="store_true",
                    help="verify the TLS certificate (iDRACs are usually self-signed, so off by default)")
@@ -397,13 +477,17 @@ def parse_args():
                    help="also store readings in a SQLite database, and chart from it so history from "
                         "earlier runs is included (default path if no PATH: %s)" % default_db_path())
     p.add_argument("--raw", action="store_true", help="print the raw CSV and exit")
-    p.add_argument("--output", choices=sorted(OUTPUTS), default="chart",
-                   help="what to produce from the readings: chart, table, raw (cache format CSV, UTC times) or csv "
+    p.add_argument("--output", choices=sorted(set(OUTPUTS) | set(LIST_OUTPUTS)),
+                   help="what to produce. For readings: chart, table, raw (cache format CSV, UTC times), csv "
                         "(CSV with host, sensor and unit columns, times in --tz/local), or xlsx / xls spreadsheets "
-                        "(see --file); --module, --chart, --width and --height apply to chart (default: chart)")
+                        "(see --file); --module, --chart, --width and --height apply to chart (default: chart). "
+                        "With --list: text, table, csv, xlsx or xls (default: text)")
     p.add_argument("--file", metavar="FILE",
                    help="file to write for --output xlsx or xls; if not given, a name is made from the host, "
                         "source, sensor and --last period in the current directory, with the right extension")
+    p.add_argument("--limits", action="store_true",
+                   help="draw the sensor's warning and critical limits on a plotext line or scatter chart "
+                        "(limits are saved when the sensor is polled over snmp)")
     p.add_argument("--module", choices=sorted(MODULES_NAMES), default="plotext",
                    help="graphing module (default: plotext)")
     p.add_argument("--chart", choices=CHARTS, default="vertical",
@@ -418,14 +502,27 @@ def parse_args():
     args = p.parse_args()
     if args.tz and args.utc:
         p.error("--tz and --utc cannot be used together")
+    if args.list and args.get:
+        p.error("--list and --get cannot be used together")
+    if args.list or args.get:  # plain text unless another format is asked for
+        args.output = args.output or "text"
+        if args.output not in LIST_OUTPUTS:
+            p.error(f"--output {args.output} does not apply to --list or --get; "
+                    f"use one of {', '.join(sorted(LIST_OUTPUTS))}")
+    else:
+        args.output = args.output or "chart"
+        if args.output not in OUTPUTS:
+            p.error(f"--output {args.output} only applies to --list or --get")
     if args.file:
         if args.output not in ("xlsx", "xls"):
             p.error("--file only applies to --output xlsx or xls")
         suffix = Path(args.file).suffix.lower()
         if suffix in (".xls", ".xlsx") and suffix != "." + args.output:
             p.error(f"--file {args.file} does not match --output {args.output}")
-    if args.list:  # --list gui means --list web
+    if args.list:  # --list gui means --list web, and --list sensors means every sensor
         args.list = SOURCE_ALIASES.get(args.list.lower(), args.list)
+        if args.list.lower() == "sensors":
+            args.list = "all"
     return args
 
 
@@ -493,7 +590,7 @@ def web_csv_to_utc(text, offset):
         except (KeyError, TypeError, ValueError):
             continue
         if is_reading(avg, peak):
-            lines.append(f"{avg:g},{peak:g},{epoch_to_csv(epoch)}")
+            lines.append(f"{num(avg)},{num(peak)},{epoch_to_csv(epoch)}")
     return "\n".join(lines) + "\n"
 
 
@@ -511,55 +608,159 @@ def web_fetch(args):
 
 
 def web_list(args):
+    """Return {sensor: Reading}; the web source has no live value or limits to give here, only the key."""
     with idrac_session(args) as (s, base, headers):
-        return web_sensors_from_session(s, base, headers)
+        return {name: Reading(key, None, None) for name, key in web_sensors_from_session(s, base, headers).items()}
 
 
-async def snmp_walk_column(args, column):
-    """Return {row index: value} for one column of the chosen metric's probe table."""
-    resolve_credentials(args)
-    try:
-        from pysnmp.hlapi.v3arch.asyncio import (
-            CommunityData, ContextData, ObjectIdentity, ObjectType,
-            SnmpEngine, UdpTransportTarget, walk_cmd)
-    except ImportError:
-        raise SourceError("pysnmp not found; install with: pip install pysnmp")
-    table = METRICS[args.metric]["table"]
-    engine = SnmpEngine()
-    try:
+async def snmp_connection(args):
+    """Return the (engine, target) shared by every walk of a poll, creating them on first use.
+
+    Creating an engine is slow (it loads MIB data), so a poll makes one and reuses it. Call snmp_close afterwards.
+    """
+    if getattr(args, "snmp_state", None) is None:
+        resolve_credentials(args)
+        try:
+            from pysnmp.hlapi.v3arch.asyncio import SnmpEngine, UdpTransportTarget
+        except ImportError:
+            raise SourceError("pysnmp not found; install with: pip install pysnmp")
+        engine = SnmpEngine()
         target = await UdpTransportTarget.create((args.host, 161), timeout=3, retries=1)
-        out = {}
-        async for err, status, _, binds in walk_cmd(
-                engine, CommunityData(args.community, mpModel=1), target, ContextData(),
-                ObjectType(ObjectIdentity(f"{table}.{column}")), lexicographicMode=False):
-            if err or status:
-                raise SourceError(f"SNMP error from {args.host}: {err or status.prettyPrint()}")
-            for oid, value in binds:
-                out[str(oid).rsplit(".", 1)[-1]] = value
-        return out
-    finally:
-        engine.close_dispatcher()
+        args.snmp_state = (engine, target)
+    return args.snmp_state
 
 
-async def snmp_read_table(args):
-    """Return {short name: (row index, reading in the metric's unit)}."""
-    metric = METRICS[args.metric]
-    names = await snmp_walk_column(args, SNMP_COL_NAME)
-    readings = await snmp_walk_column(args, SNMP_COL_READING)
-    if not names:
-        raise SourceError(f"no {args.metric} sensors returned by {args.host} (check host and --community)")
+def snmp_close(args):
+    if getattr(args, "snmp_state", None) is not None:
+        args.snmp_state[0].close_dispatcher()
+        args.snmp_state = None
+
+
+async def snmp_walk(args, oid):
+    """Return {sub-identifiers after oid, for example '1.3': value} for every value under oid."""
+    from pysnmp.hlapi.v3arch.asyncio import CommunityData, ContextData, ObjectIdentity, ObjectType, walk_cmd
+    engine, target = await snmp_connection(args)
     out = {}
-    for i, n in names.items():
-        if i in readings:
-            sensor = metric["short"](str(n))
-            out[sensor] = (i, int(readings[i]) / metric["divisor"](sensor))
+    async for err, status, _, binds in walk_cmd(
+            engine, CommunityData(args.community, mpModel=1), target, ContextData(),
+            ObjectType(ObjectIdentity(oid)), lexicographicMode=False):
+        if err or status:
+            raise SourceError(f"SNMP error from {args.host}: {err or status.prettyPrint()}")
+        for found, value in binds:
+            out[str(found)[len(oid) + 1:]] = value
     return out
 
 
+async def read_probe_table(args, table, short, divisor):
+    """Read a Dell probe table: every probe that returns a reading, with its limits.
+
+    Discrete probes (for example the power-good checks in the voltage table) return no reading and are skipped.
+    """
+    columns = [SNMP_COL_NAME, SNMP_COL_READING] + list(SNMP_COL_LIMITS.values())
+    names, readings, *limit_columns = await asyncio.gather(*(snmp_walk(args, f"{table}.{c}") for c in columns))
+    if not names:
+        raise SourceError(f"no {args.metric} sensors returned by {args.host} (check host and --community)")
+    out = {}
+    for row, name in names.items():
+        if row not in readings:
+            continue
+        sensor = short(str(name))
+        div = divisor(sensor)
+        limits = {key: int(col[row]) / div for key, col in zip(SNMP_COL_LIMITS, limit_columns) if row in col}
+        out[sensor] = Reading(f"{table}.{SNMP_COL_READING}.{row}", int(readings[row]) / div, limits or None)
+    return out
+
+
+async def read_power(args):
+    """Power: the amperage probes (supply currents and system watts) plus the power usage table (energy, peaks)."""
+    usage_table = f"{DELL}.4.600.60.1"
+    probes, *columns = await asyncio.gather(
+        read_probe_table(args, f"{DELL}.4.600.30.1", _power_name, lambda s: 10 if s.endswith("-current") else 1),
+        *(snmp_walk(args, f"{usage_table}.{c}") for c in POWER_USAGE))
+    for (column, (sensor, divisor)), values in zip(POWER_USAGE.items(), columns):
+        if values:
+            row = sorted(values)[0]  # one row, "System Power Consumption data"
+            probes[sensor] = Reading(f"{usage_table}.{column}.{row}", int(values[row]) / divisor, None)
+    return probes
+
+
+async def read_health(args):
+    """Status codes of the components in HEALTH_TABLES, plus the overall system status."""
+    out = {}
+    limit = asyncio.Semaphore(6)  # walk many tables at once, but not so many that the iDRAC drops requests
+
+    async def walk(oid):
+        async with limit:
+            return await snmp_walk(args, oid)
+
+    overall, *walked = await asyncio.gather(
+        walk(f"{DELL}.2.1"),
+        *(walk(f"{table}.{column}") for table, name_column, status_column, _ in HEALTH_TABLES
+          for column in (name_column, status_column)))
+    if overall:
+        out["system"] = Reading(f"{DELL}.2.1.0", int(next(iter(overall.values()))), None)
+    for (table, _, status_column, short), names, statuses in zip(HEALTH_TABLES, walked[0::2], walked[1::2]):
+        for row, name in names.items():
+            if row not in statuses:
+                continue
+            sensor, n = short(str(name)), 2
+            while sensor in out:  # two components with the same name: add a number
+                sensor, n = f"{short(str(name))}-{n}", n + 1
+            out[sensor] = Reading(f"{table}.{status_column}.{row}", int(statuses[row]), None)
+    if not out:
+        raise SourceError(f"no health data returned by {args.host} (check host and --community)")
+    return out
+
+
+async def read_network(args):
+    """Byte counters of the iDRAC's own network interfaces (IF-MIB), as <interface>-in and <interface>-out."""
+    names, received, sent = await asyncio.gather(
+        *(snmp_walk(args, f"{IF_XTABLE}.{c}") for c in (1, 6, 10)))
+    out = {}
+    for row, name in names.items():
+        if str(name) == "lo":  # loopback traffic says nothing about the network
+            continue
+        for direction, column, values in (("in", 6, received), ("out", 10, sent)):
+            if row in values:
+                out[f"{_strip(str(name))}-{direction}"] = Reading(f"{IF_XTABLE}.{column}.{row}", int(values[row]), None)
+    if not out:
+        raise SourceError(f"no network interfaces returned by {args.host} (check host and --community)")
+    return out
+
+
+async def snmp_read_table(args):
+    """Return {sensor: Reading} for the chosen metric."""
+    try:
+        await snmp_connection(args)  # created here, before any concurrent walks start
+        return await METRICS[args.metric]["read"](args)
+    finally:
+        snmp_close(args)
+
+
 def snmp_list(args):
-    table = asyncio.run(snmp_read_table(args))
-    base = METRICS[args.metric]["table"]
-    return {name: f"{base}.{SNMP_COL_READING}.1.{i}" for name, (i, _) in table.items()}
+    """Return {sensor: Reading}: the key, the current value and the limits of every sensor of the metric."""
+    return asyncio.run(snmp_read_table(args))
+
+
+def limits_path(args):
+    """Where a sensor's limits are kept. Not per source, so web charts of the same host and sensor can use them."""
+    safe = lambda v: re.sub(r"[^\w.-]", "_", v)
+    return args.cache_dir / f"{safe(args.host)}_{safe(args.metric)}-{safe(args.sensor)}.limits.json"
+
+
+def save_limits(args, limits):
+    path = limits_path(args)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(limits))
+    tmp.replace(path)
+
+
+def load_limits(args):
+    try:
+        return json.loads(limits_path(args).read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def snmp_fetch(args):
@@ -567,14 +768,16 @@ def snmp_fetch(args):
     table = asyncio.run(snmp_read_table(args))
     if args.sensor not in table:
         raise SourceError(f"unknown sensor {args.sensor!r}; available: {', '.join(sorted(table))}")
-    value = table[args.sensor][1]
+    reading = table[args.sensor]
+    if reading.limits:
+        save_limits(args, reading.limits)
     history = read_cache(cache_path(args)) or "Average,Peak,Time\n"
     if not history.endswith("\n"):
         history += "\n"
-    return history + f"{value:g},{value:g},{epoch_to_csv(int(time.time()))}\n"
+    return history + f"{num(reading.value)},{num(reading.value)},{epoch_to_csv(int(time.time()))}\n"
 
 
-# Each source provides list(args) -> {sensor: key} and fetch(args) -> CSV text
+# Each source provides list(args) -> {sensor: Reading} and fetch(args) -> CSV text
 # ("Average,Peak,Time" rows). accumulate=True means fetch() returns only a current reading
 # appended to the cached history. Others (redfish, ipmi, ...) can be added here.
 SOURCE_ALIASES = {"gui": "web"}  # alternative names accepted for --source and --list
@@ -603,7 +806,7 @@ def short_label(when):
     return when.strftime("%b %d %H:%M:%S")
 
 
-def graph_termgraph(data, width, height, chart, title, unit):
+def graph_termgraph(data, width, height, chart, title, unit, limits=None):
     if chart not in CHART_FLAGS:
         sys.exit(f"termgraph does not support --chart {chart}; use one of {', '.join(sorted(CHART_FLAGS))}")
     if shutil.which("termgraph") is None:
@@ -619,7 +822,7 @@ def graph_termgraph(data, width, height, chart, title, unit):
             if flat:
                 # termgraph 0.7.6 does not scale a series whose values are all equal (it draws one
                 # block per unit), so draw a full-width bar and carry the real value in the label
-                name += f"_{avg:g}{unit.replace(' ', '_')}"
+                name += f"_{num(avg)}{unit.replace(' ', '_')}"
                 avg = peak = bar_width
             f.write(f"{name},{avg},{peak}\n")
         if flat:
@@ -630,7 +833,11 @@ def graph_termgraph(data, width, height, chart, title, unit):
                         *CHART_FLAGS[chart]], check=True)
 
 
-def graph_plotext(data, width, height, chart, title, unit):
+LIMIT_LINES = [("upper_critical", "Upper critical", "red"), ("upper_warning", "Upper warning", "orange"),
+               ("lower_warning", "Lower warning", "orange"), ("lower_critical", "Lower critical", "red")]
+
+
+def graph_plotext(data, width, height, chart, title, unit, limits=None):
     try:
         import plotext as plt
     except ImportError:
@@ -652,6 +859,9 @@ def graph_plotext(data, width, height, chart, title, unit):
         count = max(2, (usable - 8) // 24)  # labels are 19 characters wide, so 3 fit in 80 columns
         ticks = [epochs[0] + (epochs[-1] - epochs[0]) * i / (count - 1) for i in range(count)]
         plt.xticks(ticks, [dt.datetime.fromtimestamp(t, zone).strftime("%d/%m/%Y %H:%M:%S") for t in ticks])
+        for key, text, colour in LIMIT_LINES:
+            if limits and key in limits:  # horizontal lines; the chart's scale widens to include them
+                plot([epochs[0], epochs[-1]], [limits[key]] * 2, label=f"{text} {num(limits[key])}{unit}", color=colour)
     elif chart == "vertical":
         plt.multiple_bar(labels, [avg, peak], labels=names)
     elif chart == "horizontal":
@@ -687,7 +897,16 @@ def display_rows(args, metric, rows):
 def output_chart(args, metric, rows):
     """Draw the readings as a chart in the terminal."""
     data, _, title = display_rows(args, metric, rows)
-    MODULES[args.module](data, args.width, args.height, args.chart, title, metric["unit"](args.sensor))
+    limits = None
+    if args.limits:
+        if args.module != "plotext" or args.chart not in ("line", "scatter"):
+            print("warning: --limits only applies to plotext line and scatter charts", file=sys.stderr)
+        else:
+            limits = load_limits(args)
+            if not limits:
+                print(f"warning: no limits saved for {args.sensor}; poll it with --source snmp first "
+                      "(not every sensor has limits)", file=sys.stderr)
+    MODULES[args.module](data, args.width, args.height, args.chart, title, metric["unit"](args.sensor), limits)
 
 
 def output_raw(args, metric, rows):
@@ -706,7 +925,7 @@ def output_csv(args, metric, rows):
         if when.tzinfo is None:  # this computer's local time: attach its offset so the row is unambiguous
             when = when.astimezone()
         writer.writerow([when.isoformat(timespec="seconds"), args.host, args.source, args.metric, args.sensor,
-                         f"{avg:g}", f"{peak:g}", unit])
+                         num(avg), num(peak), unit])
 
 
 def period_label(last):
@@ -815,7 +1034,7 @@ def output_table(args, metric, rows):
     data, zone_name, title = display_rows(args, metric, rows)
     unit = metric["unit"](args.sensor)
     table = AsciiTable([[f"Time ({zone_name})", f"Average ({unit.strip()})", f"Peak ({unit.strip()})"]]
-                       + [[when.strftime("%Y-%m-%d %H:%M:%S"), f"{avg:g}", f"{peak:g}"] for when, avg, peak in data])
+                       + [[when.strftime("%Y-%m-%d %H:%M:%S"), num(avg), num(peak)] for when, avg, peak in data])
     table.justify_columns = {0: "left", 1: "right", 2: "right"}
     # printed above the table: terminaltables silently drops a title that is wider than the table
     print(title)
@@ -829,8 +1048,137 @@ OUTPUTS = {"chart": output_chart, "table": output_table, "raw": output_raw, "csv
            "xlsx": output_xlsx, "xls": output_xls}
 
 
+def format_limits(limits):
+    """'warn 3..42 crit -7..47' (lower..upper, '-' where a limit is missing), or '-' if there are none."""
+    if not limits:
+        return "-"
+    g = lambda key: num(limits[key]) if key in limits else "-"
+    return f"warn {g('lower_warning')}..{g('upper_warning')} crit {g('lower_critical')}..{g('upper_critical')}"
+
+
+def cached_value(args):
+    """The newest reading in the cache for the current host, source, metric and sensor, or None."""
+    text = read_cache(cache_path(args))
+    rows = parse_rows(text) if text else []
+    return rows[-1][1] if rows else None
+
+
+LIST_HEADER = ("SOURCE", "METRIC", "SENSOR", "UNIT", "VALUE", "LIMITS", "KEY")
+LIMIT_KEYS = ("lower_critical", "lower_warning", "upper_warning", "upper_critical")
+
+
+def list_display_rows(records):
+    """Rows of strings for the text and table outputs: '-' for a missing value, limits as 'warn a..b crit c..d'."""
+    return [(source, metric, sensor, unit, "-" if value is None else num(value), format_limits(limits), key)
+            for source, metric, sensor, unit, value, limits, key in records]
+
+
+def list_data_rows(records):
+    """Rows for the CSV and spreadsheet outputs: numbers kept as numbers and the limits in four columns of their own.
+
+    Returns (headings, rows); a missing value or limit is None.
+    """
+    head = ("source", "metric", "sensor", "unit", "value") + LIMIT_KEYS + ("key",)
+    rows = [(source, metric, sensor, unit, value, *[(limits or {}).get(k) for k in LIMIT_KEYS], key)
+            for source, metric, sensor, unit, value, limits, key in records]
+    return head, rows
+
+
+def list_text(args, records):
+    """The default: aligned columns of plain text, with VALUE right-aligned."""
+    rows = list_display_rows(records)
+    widths = [max(len(r[i]) for r in [LIST_HEADER] + rows) for i in range(len(LIST_HEADER) - 1)]
+    for row in [LIST_HEADER] + rows:
+        cells = [c.rjust(w) if i == 4 else c.ljust(w) for i, (c, w) in enumerate(zip(row, widths))]
+        print("  ".join(cells) + "  " + row[-1])
+
+
+def list_table(args, records):
+    try:
+        from terminaltables import AsciiTable
+    except ImportError:
+        sys.exit("terminaltables not found; install with: pip install terminaltables")
+    table = AsciiTable([list(LIST_HEADER)] + [list(r) for r in list_display_rows(records)])
+    table.justify_columns = {4: "right"}
+    print(table.table)
+
+
+def list_csv(args, records):
+    head, rows = list_data_rows(records)
+    writer = csv.writer(sys.stdout, lineterminator="\n")
+    writer.writerow(head)
+    for row in rows:
+        writer.writerow(["" if v is None else num(v) if isinstance(v, (int, float)) else v for v in row])
+
+
+def list_spreadsheet_path(args, extension):
+    """--file, or <host>_sensors[_<source>][_<metric>] in the current directory."""
+    if args.file:
+        path = Path(args.file)
+        return path if path.suffix else path.with_suffix(extension)
+    safe = lambda v: re.sub(r"[^\w.-]", "_", v)
+    source = args.source or (args.list if args.list in SOURCES else None)
+    metric = args.metric or (args.list if args.list in METRIC_NAMES else None)
+    return Path("_".join([safe(args.host), "sensors"] + [safe(p) for p in (source, metric) if p]) + extension)
+
+
+def column_width(heading, values):
+    """Width in characters for a spreadsheet column: the longest of the heading and the values, plus a margin."""
+    return max([len(heading)] + [len(str(v)) for v in values if v is not None]) + 2
+
+
+def list_xlsx(args, records):
+    try:
+        import xlsxwriter
+    except ImportError:
+        sys.exit("XlsxWriter not found; install with: pip install XlsxWriter")
+    path = list_spreadsheet_path(args, ".xlsx")
+    head, rows = list_data_rows(records)
+    try:
+        with xlsxwriter.Workbook(path) as book:
+            sheet = book.add_worksheet("Sensors")
+            sheet.write_row(0, 0, head, book.add_format({"bold": True}))
+            for r, row in enumerate(rows, start=1):
+                for c, v in enumerate(row):
+                    if v is not None:
+                        sheet.write(r, c, v)
+            for c, h in enumerate(head):
+                sheet.set_column(c, c, column_width(h, [row[c] for row in rows]))
+            sheet.freeze_panes(1, 0)
+    except (OSError, xlsxwriter.exceptions.XlsxWriterException) as e:
+        sys.exit(f"Could not write {path}: {e}")
+    print(f"Wrote {len(rows)} sensor{'s' if len(rows) != 1 else ''} to {path}")
+
+
+def list_xls(args, records):
+    try:
+        import xlwt
+    except ImportError:
+        sys.exit("xlwt not found; install with: pip install xlwt")
+    path = list_spreadsheet_path(args, ".xls")
+    head, rows = list_data_rows(records)
+    book = xlwt.Workbook()
+    sheet = book.add_sheet("Sensors")
+    bold = xlwt.easyxf("font: bold on")
+    for c, h in enumerate(head):
+        sheet.write(0, c, h, bold)
+        sheet.col(c).width = 256 * column_width(h, [row[c] for row in rows])
+    for r, row in enumerate(rows, start=1):
+        for c, v in enumerate(row):
+            if v is not None:
+                sheet.write(r, c, v)
+    try:
+        book.save(str(path))
+    except OSError as e:
+        sys.exit(f"Could not write {path}: {e}")
+    print(f"Wrote {len(rows)} sensor{'s' if len(rows) != 1 else ''} to {path}")
+
+
+LIST_OUTPUTS = {"text": list_text, "table": list_table, "csv": list_csv, "xlsx": list_xlsx, "xls": list_xls}
+
+
 def list_all(args):
-    """Print an aligned table of source, metric, sensor and key for every matching sensor; return an exit code."""
+    """List every matching sensor in the chosen --output format (text by default); return an exit code."""
     sources, metrics = [args.source] if args.source else sorted(SOURCES), [args.metric] if args.metric else None
     if args.list != "all":
         if args.list in SOURCES:
@@ -838,9 +1186,9 @@ def list_all(args):
         elif args.list in METRIC_NAMES:
             metrics = [args.list]
         else:
-            sys.exit(f"--list: {args.list!r} is not a source ({', '.join(sorted(SOURCES))}) "
+            sys.exit(f"--list: {args.list!r} is not sensors, a source ({', '.join(sorted(SOURCES))}) "
                      f"or a metric ({', '.join(METRIC_NAMES)})")
-    rows, failed = [], 0
+    records, failed = [], 0
     for source in sources:
         for metric in (metrics or SOURCES[source]["metrics"]):
             if metric not in SOURCES[source]["metrics"]:
@@ -853,19 +1201,66 @@ def list_all(args):
                 failed += 1
                 print(f"{source}/{metric}: {e}", file=sys.stderr)
                 continue
-            rows += [(source, metric, name, key) for name, key in sorted(sensors.items())]
-    if rows:
-        header = ("SOURCE", "METRIC", "SENSOR", "KEY")
-        widths = [max(len(r[i]) for r in [header] + rows) for i in range(3)]
-        for row in [header] + rows:
-            print("  ".join(c.ljust(w) for c, w in zip(row, widths)) + "  " + row[3])
-    return 0 if rows else 1 if failed else 0
+            for name, reading in sorted(sensors.items()):
+                sub.sensor = name
+                value, limits = reading.value, reading.limits
+                if source == "web":  # no live reading without a slow fetch: use what is already cached
+                    value, limits = cached_value(sub), load_limits(sub)
+                if METRICS[metric].get("counter"):  # a counter is not a value; its rate needs two readings
+                    value = None
+                records.append((source, metric, name, METRICS[metric]["unit"](name).strip(), value, limits, reading.key))
+    if records:
+        LIST_OUTPUTS[args.output](args, records)
+    return 0 if records else 1 if failed else 0
+
+
+COUNTER_SAMPLE_SECONDS = 2  # --get on a counter metric waits this long between its two readings
+
+
+def get_value(args):
+    """Poll one snmp sensor now and print its value; return an exit code."""
+    args.source = args.source or "snmp"
+    if args.source != "snmp":
+        sys.exit(f"--get needs --source snmp: the {args.source} source has no live value to read")
+    args.metric = args.metric or "temperature"
+    metric = METRICS[args.metric]
+    args.sensor = args.sensor or metric["default"]
+    try:
+        table = asyncio.run(snmp_read_table(args))
+        if args.sensor not in table:
+            raise SourceError(f"unknown sensor {args.sensor!r}; available: {', '.join(sorted(table))}")
+        reading = table[args.sensor]
+        value = reading.value
+        if metric.get("counter"):  # a counter has no value of its own: measure the rate over a short interval
+            started = time.monotonic()
+            time.sleep(COUNTER_SAMPLE_SECONDS)
+            after = asyncio.run(snmp_read_table(args))[args.sensor].value
+            elapsed = time.monotonic() - started
+            value = round((after - value) / elapsed, 3) if after >= value else None  # a lower counter means a restart
+            if value is None:
+                raise SourceError("the counter went down while measuring (the iDRAC restarted?); try again")
+    except SourceError as e:
+        sys.exit(f"Failed to read {args.sensor} from {args.host}: {e}")
+    record = (args.source, args.metric, args.sensor, metric["unit"](args.sensor).strip(), value, reading.limits,
+              reading.key)
+    GET_OUTPUTS[args.output](args, [record])
+    return 0
+
+
+def get_text(args, records):
+    """The default for --get: just the value and its unit, for example '16 °C'."""
+    _, _, _, unit, value, _, _ = records[0]
+    print(f"{num(value)} {unit}".strip())
+
+
+# --get shows its one record like --list does, except that plain text is the bare value
+GET_OUTPUTS = {**LIST_OUTPUTS, "text": get_text}
 
 
 def main():
     args = parse_args()
-    if args.no_fetch and (args.list or args.save_credentials or args.refresh):
-        sys.exit("--no-fetch cannot be combined with --list, --save-credentials or --refresh, "
+    if args.no_fetch and (args.list or args.get or args.save_credentials or args.refresh):
+        sys.exit("--no-fetch cannot be combined with --list, --get, --save-credentials or --refresh, "
                  "which all need to contact the iDRAC")
     if args.forget_credentials:
         try:
@@ -888,6 +1283,8 @@ def main():
         print(f"Credentials for {args.host} ({saving.source}) saved to the OS keyring", flush=True)
     if args.list:
         sys.exit(list_all(args))
+    if args.get:
+        sys.exit(get_value(args))
     args.source = args.source or "web"
     args.metric = args.metric or "temperature"
     if args.metric not in SOURCES[args.source]["metrics"]:
@@ -923,6 +1320,12 @@ def main():
                  f"in {args.db}; run once without --no-fetch")
     if not data:
         sys.exit("No numeric data found in CSV; rerun with --raw to inspect it")
+    if metric.get("counter"):
+        # the stored values are ever-growing counters; show them as rates
+        data = to_rates(data)
+        if not data:
+            sys.exit(f"{args.metric} readings are counters, and a rate needs at least two readings: "
+                     "run again after a while (or from cron) to collect more")
     try:
         data = select_last(data, args.last)
     except ValueError as e:
