@@ -8,13 +8,41 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.1.4 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.1.7 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-10-06
+
+### Changed
+- The default cache directory is `~/.cache/ragdoll` (or `$XDG_CACHE_HOME/ragdoll`) instead of `~/.cache/idrac`.
+  Cached files from earlier versions are not found in the new location: move the old directory
+  (`mv ~/.cache/idrac ~/.cache/ragdoll`) to keep your SNMP history.
+- The option to choose the cache directory is now `--cachedir`. `--cache-dir` still works as an alias.
+
+## [0.1.6] - 2026-10-06
+
+### Changed
+- Credentials are saved in the keyring under the service name `ragdoll:<host>` instead of `idrac-temp:<host>`.
+  Credentials saved by an earlier version are not found under the new name: run `--save-credentials` again, and
+  remove the old entries from your keyring if you have any.
+
+### Fixed
+- `--save-credentials` was ignored when combined with `--list` (since 0.1.2), because the listing exited first.
+  Credentials are now saved before the listing runs, for `--source` or, if that is not given, the source named
+  after `--list`, otherwise `web`. The confirmation message names the source.
+
+## [0.1.5] - 2026-10-06
+
 ### Added
 - "Help Support Development" section in the README.
+
+### Changed
+- The script is renamed from `idrac_temp.py` to `ragdoll.py`, and the project is now called ragdoll. Update any
+  cron entries or aliases that call the old name.
+- New project description: "Redfish/API/GUI/DRAC/Other Log Linter - Converts iDRAC Telemetry and other information
+  into more useful formats". It is used in the README and in the script's `--help`.
 
 ## [0.1.4] - 2026-10-06
 
