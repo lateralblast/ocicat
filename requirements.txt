@@ -3,3 +3,6 @@ termgraph
 plotext==5.3.2
 pysnmp
 keyring
+terminaltables
+XlsxWriter
+xlwt

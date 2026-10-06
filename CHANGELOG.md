@@ -8,10 +8,160 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.1.7 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.3.0 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-10-06
+
+### Added
+- `--output xlsx` and `--output xls` write the selected readings to an Excel workbook (`XlsxWriter` for `.xlsx`,
+  `xlwt` for `.xls`). One `Readings` sheet with a bold heading row and columns `Time (<zone>)`, `Time (UTC)`,
+  `Average (<unit>)` and `Peak (<unit>)`; times are real Excel dates.
+- `--file FILE` names the output file. It only applies to `xlsx` and `xls`, adds the extension if the name has none,
+  and rejects a name with the other spreadsheet extension.
+- Without `--file`, a name is made in the current directory:
+  `<host>_<source>_<metric>-<sensor>_last-<period>.<ext>`, for example
+  `192.0.2.20_web_temperature-inlet_last-1w.xlsx`.
+- `.xls` refuses more than 65,535 readings, with a message suggesting `.xlsx` or a smaller `--last`.
+- `XlsxWriter` and `xlwt` added to `requirements.txt`; "Spreadsheet output" section in the README.
+
+## [0.2.9] - 2026-10-06
+
+### Added
+- `--output csv` prints the selected readings as CSV with `time`, `host`, `source`, `metric`, `sensor`, `average`,
+  `peak` and `unit` columns, so each row describes itself. Times are ISO 8601 with their UTC offset, in local time or
+  the zone chosen with `--tz` or `--utc`.
+- `--output raw` prints the selected readings in the cache format (`Average,Peak,Time`, UTC times ending in `Z`).
+- Both honour `--last` (`--last 0` means every reading). The older `--raw` flag is unchanged: it prints every
+  stored reading and ignores `--last`.
+- "CSV output" section in the README.
+
+### Added
+- "Example output" section in the README with real output for `--list`, line, bar and termgraph charts, the table
+  output, SNMP readings with `--tz`, and `--raw`.
+
+## [0.2.8] - 2026-10-06
+
+### Added
+- `--output table` prints the readings as a table (time, average and peak, with units) using `terminaltables`, in
+  the zone chosen by `--tz` or `--utc`. It uses the plain ASCII style, which also works when piped. The chart title
+  is printed above the table, because `terminaltables` drops a title wider than the table.
+- `terminaltables` added to `requirements.txt`.
+- "Table output" section in the README.
+
+## [0.2.7] - 2026-10-06
+
+### Added
+- `--output` selects what is produced from the readings. `chart` is the default and the only choice for now.
+  Outputs are registered in an `OUTPUTS` table, so new kinds (a table, JSON, ...) can be added later. `--module`,
+  `--chart`, `--width` and `--height` apply to `chart`.
+
+### Fixed
+- Piping output into a command that exits early (for example `ragdoll.py --raw | head -2`) printed a
+  `BrokenPipeError` traceback. The script now exits quietly.
+
+## [0.2.6] - 2026-10-06
+
+### Fixed
+- The time labels on the x-axis of `line` and `scatter` charts (plotext) were shifted by this computer's UTC offset,
+  so on an AEDT machine every label was 11 hours late: a sample at 06:00:31 local was labelled 17:00:31. This also
+  affected `--tz` and `--utc`, which showed the same shift. plotext 5.3.2's date axis adds the machine's offset to
+  whatever it is given. The chart now plots Unix times and draws the axis labels itself, in the chosen time zone.
+  Bar, stacked and histogram charts, and termgraph, were not affected.
+
+### Changed
+- The number of x-axis labels on `line` and `scatter` charts follows the usable width: 3 at 80 columns, more in a
+  wider terminal.
+
+## [0.2.5] - 2026-10-06
+
+### Changed
+- When `--db` stores readings, any "no reading" rows (`-128`) that earlier versions (0.1.8 to 0.2.3) saved in the
+  database are deleted and the file is compacted with `VACUUM`, so the space they used is freed. A test database
+  holding 23,237 such rows shrank from about 990 KB to 8 KB. A database with no such rows is not touched.
+  New readings of this kind were already never stored from 0.2.4.
+
+## [0.2.4] - 2026-10-06
+
+### Fixed
+- Rows where the iDRAC reports `-128` for both Average and Peak, its marker for "no reading", are now skipped. They
+  used to be charted as -128 °C spikes (23,237 of 48,984 rows, 47%, in one iDRAC's history). They are dropped when
+  the web CSV is fetched, when a cache is read, when rows are stored in the database and when they are read back from
+  it, so caches and databases from earlier versions are cleaned up without being rewritten.
+
+### Changed
+- `--raw` prints the readings that would be charted, in the cache format, instead of the cache file as it is, so it
+  no longer includes the skipped rows. It still prints the file unchanged if it holds no readable rows, to help you
+  inspect a malformed one.
+
+## [0.2.3] - 2026-10-06
+
+### Added
+- `--tz ZONE` shows chart times in a named time zone (for example `Australia/Sydney` or `America/New_York`), using
+  Python's `zoneinfo`, instead of this computer's local time zone. An unknown name is rejected, and `--tz` cannot
+  be combined with `--utc`. The stored data, cache and `--raw` output stay in UTC.
+
+## [0.2.2] - 2026-10-06
+
+### Added
+- `gui` is accepted as an alias for the `web` source in `--source` and `--list` (case-insensitive). The alias uses
+  the same cache files and database rows as `web`.
+
+## [0.2.1] - 2026-10-06
+
+### Added
+- `--username` as an alias for `--user`, and `--password` as an alias for `--pass`.
+
+## [0.2.0] - 2026-10-06
+
+### Fixed
+- Times from the two sources were in different, unmarked time zones: snmp readings were stamped with this
+  computer's local time and the web source's CSV used the iDRAC's own wall clock, so combining them in `--db` or
+  in one chart misaligned them (by 11 hours on the author's setup).
+
+### Changed
+- All times are now UTC inside ragdoll. The cache and `--raw` output use ISO 8601 with a `Z` (for example
+  `2026-10-06T04:27:44Z`) and the database stores `time` as an integer Unix timestamp (schema version 2).
+- The web source converts the iDRAC's wall clock times to UTC when it fetches them. The offset is measured by
+  comparing the iDRAC's clock (via Redfish `DateTime`) with this computer's clock, not taken from the iDRAC's
+  configured time zone, which can be wrong.
+- Charts show times in local time, with the time zone name in the title (for example `[AEDT]`).
+- Caches and databases from earlier versions are not read. An old cache is refetched (web) or ignored (snmp), and an
+  old database is refused with a message asking you to delete it and run again.
+
+### Added
+- `--utc` shows chart times in UTC.
+- `--tz-offset OFFSET` sets the offset of the iDRAC's clock from UTC for the web source (for example `UTC`, `+10:00`,
+  `-05:00`), instead of measuring it.
+- "Time zones" section in the README.
+
+### Added
+- `TODO.md`, with database performance measurements and planned improvements.
+
+## [0.1.9] - 2026-10-06
+
+### Added
+- `--no-fetch` charts what is already stored without contacting the iDRAC: from the `--db` database if given,
+  otherwise from the cache regardless of age. `--raw` prints the stored readings as CSV.
+- "Charting without contacting the iDRAC" section in the README.
+
+### Changed
+- `--no-fetch` is rejected with `--list`, `--save-credentials` or `--refresh`, which need the iDRAC.
+
+## [0.1.8] - 2026-10-06
+
+### Added
+- `--db [PATH]` stores readings in a SQLite database, using the built-in `sqlite3` module, and draws charts from
+  it so that history from earlier runs and sources is included. Without `PATH` the database is
+  `~/.local/share/ragdoll/ragdoll.db` (or `$XDG_DATA_HOME/ragdoll/ragdoll.db`).
+- One `readings` table keyed on host, source, metric, sensor and time. Rows already stored are skipped, so
+  repeating a run is safe; the web source's full history (about 61,000 rows) is stored in about a second.
+- "Storing readings in SQLite" section in the README.
+
+### Added
+- "Chart CPU temperatures" example in the README, including how to build up SNMP history with cron.
 
 ## [0.1.7] - 2026-10-06
 
