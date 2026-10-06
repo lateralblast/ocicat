@@ -19,11 +19,14 @@ import copy
 import csv
 import datetime as dt
 import getpass
+import importlib.util
 import io
 import json
 import logging
 import os
+import platform
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -35,10 +38,40 @@ import time
 import zoneinfo
 from pathlib import Path
 
+# Modules from requirements.txt: import name -> pip requirement
+REQUIRED_MODULES = {"requests": "requests", "urllib3": "urllib3", "paramiko": "paramiko", "termgraph": "termgraph",
+                    "plotext": "plotext==5.3.2", "pysnmp": "pysnmp", "keyring": "keyring",
+                    "terminaltables": "terminaltables", "xlsxwriter": "XlsxWriter", "xlwt": "xlwt",
+                    "dracclient": "python-dracclient", "six": "six"}
+
+
+def install_missing_modules():
+    """Install any module in REQUIRED_MODULES that cannot be found, with this interpreter's pip.
+
+    find_spec only looks for the module, so the check costs nothing when everything is installed. --no-install or
+    RAGDOLL_NO_INSTALL=1 turns it off; the modules that are optional keep falling back as before."""
+    if "--no-install" in sys.argv[1:] or os.environ.get("RAGDOLL_NO_INSTALL"):
+        return
+    missing = [req for mod, req in REQUIRED_MODULES.items() if importlib.util.find_spec(mod) is None]
+    if not missing:
+        return
+    print(f"Installing missing Python modules: {' '.join(missing)}", file=sys.stderr)
+    cmd = [sys.executable, "-m", "pip", "install", "--quiet"]
+    if sys.prefix == sys.base_prefix and not os.access(sys.prefix, os.W_OK):
+        cmd.append("--user")  # system Python outside a virtual environment: do not write to its site-packages
+    result = subprocess.run(cmd + missing)
+    importlib.invalidate_caches()
+    if result.returncode != 0:
+        print(f"Warning: could not install {' '.join(missing)}; install them with "
+              f"'{sys.executable} -m pip install -r requirements.txt' (or use a virtual environment)", file=sys.stderr)
+
+
+install_missing_modules()
+
 import requests
 import urllib3
 
-__version__ = "0.4.9"
+__version__ = "0.5.1"
 
 
 class SourceError(Exception):
@@ -564,8 +597,10 @@ def parse_args():
     p = argparse.ArgumentParser(description=". ".join(q.replace("\n", " ") for q in paragraphs[:2]),
                                 epilog=paragraphs[2].replace("\n", " "))
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    p.add_argument("--host", help="iDRAC address, e.g. 192.168.8.98. With --source lmsensors it is optional: without it this "
-                                  "computer is read, with it ragdoll runs sensors on that computer over ssh")
+    p.add_argument("--no-install", action="store_true",
+                   help="do not install missing Python modules with pip at startup (or set RAGDOLL_NO_INSTALL=1)")
+    p.add_argument("--host", help="iDRAC address, e.g. 192.168.8.98. With --source lmsensors or system it is optional: without it "
+                                  "this computer is read, with it ragdoll runs the commands on that computer over ssh")
     p.add_argument("--user", "--username", dest="user", help="iDRAC username (web source; else $IDRAC_USER or the keyring)")
     p.add_argument("--pass", "--password", dest="password",
                    help="iDRAC password (web source; else $IDRAC_PASS, the keyring, or a prompt)")
@@ -578,7 +613,8 @@ def parse_args():
     p.add_argument("--source", choices=sorted(SOURCES), type=lambda v: SOURCE_ALIASES.get(v.lower(), v.lower()),
                    help="where sensor data comes from: web is the iDRAC web interface (history), "
                         "snmp reads the current value and builds history in the cache, lmsensors does the same for this "
-                        "computer's own sensors (lm-sensors), and redfish, racadm and wsman provide only the inventory "
+                        "computer's own sensors (lm-sensors), redfish, racadm and wsman provide only the inventory, and "
+                        "system gives this computer's inventory (system_profiler on macOS, dmidecode on Linux) "
                         "(gui is an alias for web; default: web; "
                         "with --list, all sources)")
     p.add_argument("--metric", choices=METRIC_NAMES,
@@ -674,7 +710,8 @@ def parse_args():
             if args.host.startswith("-") or (args.user and (args.user.startswith("-") or re.search(r"\s", args.user))):
                 p.error("--host and --user must not start with '-' or contain spaces")
             if args.password:
-                p.error("ssh logs in with a key or the ssh agent, so --pass does not apply to --source lmsensors")
+                p.error(f"ssh logs in with a key or the ssh agent, so --pass does not apply to --source "
+                        f"{args.source or args.list}")
         else:
             args.host = socket.gethostname()
     elif not args.host:
@@ -1000,11 +1037,11 @@ def ssh_config_for(host):
     return dict(paramiko.SSHConfig.from_path(str(path)).lookup(host)) if path.exists() else {}
 
 
-def lm_ssh_command(args):
-    """The ssh command that prints `sensors -j` on args.host (the fallback; batch mode, so it never asks for a password)."""
+def lm_ssh_command(args, command="sensors -j"):
+    """The ssh command that runs command on args.host (the fallback; batch mode, so it never asks for a password)."""
     target = f"{args.user}@{args.host}" if args.user else args.host
     # `--` keeps a host from being read as an ssh option
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", "--", target, "sensors -j"]
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", "--", target, command]
 
 
 class SshUnreachable(SourceError):
@@ -1053,6 +1090,11 @@ def ssh_connect(args, password=None):
 
 def lm_run_remote(args):
     """Run `sensors -j` on args.host: returns (exit status, stdout, stderr)."""
+    return ssh_run(args, "sensors -j")
+
+
+def ssh_run(args, command):
+    """Run a shell command on args.host over ssh: returns (exit status, stdout, stderr)."""
     try:
         import paramiko
         use_paramiko = "proxyjump" not in ssh_config_for(args.host)
@@ -1060,11 +1102,11 @@ def lm_run_remote(args):
         use_paramiko = False
     if not use_paramiko:  # paramiko is missing, or ~/.ssh/config needs ProxyJump: use the ssh command
         try:
-            run = subprocess.run(lm_ssh_command(args), capture_output=True, text=True, timeout=60)
+            run = subprocess.run(lm_ssh_command(args, command), capture_output=True, text=True, timeout=60)
         except FileNotFoundError:
             raise SourceError("neither the paramiko module nor the ssh command is available; pip install paramiko")
         except subprocess.TimeoutExpired:
-            raise SourceError(f"sensors -j took too long on {args.host}")
+            raise SourceError(f"{command} took too long on {args.host}")
         if run.returncode == 255:  # ssh's own failure
             raise SourceError(f"could not ssh to {args.host}: {run.stderr.strip() or 'connection failed'} (ssh logs in with "
                               "a key or the ssh agent, never a password)")
@@ -1072,7 +1114,7 @@ def lm_run_remote(args):
     for attempt in (1, 2):  # a connection kept from an earlier poll may have dropped: reconnect once
         client = ssh_connect(args)
         try:
-            _, out, err = client.exec_command("sensors -j", timeout=30)
+            _, out, err = client.exec_command(command, timeout=30)
             text, errors = out.read().decode(errors="replace"), err.read().decode(errors="replace")
             return out.channel.recv_exit_status(), text, errors
         except (paramiko.SSHException, EOFError, OSError) as e:
@@ -1081,7 +1123,7 @@ def lm_run_remote(args):
                     del _SSH_CLIENTS[known]
             client.close()
             if attempt == 2:
-                raise SourceError(f"sensors -j failed over ssh on {args.host}: {e}")
+                raise SourceError(f"{command} failed over ssh on {args.host}: {e}")
 
 
 def lm_read(args):
@@ -1190,6 +1232,9 @@ SOURCES = {
     # and so does wsman (see read_inventory_wsman)
     "wsman": {"list": lambda args: wsman_list(args), "fetch": lambda args: wsman_fetch(args),
               "accumulate": False, "metrics": ()},
+    # the inventory of this computer (or --host over ssh) from system_profiler or dmidecode (see read_inventory_system)
+    "system": {"list": lambda args: system_list(args), "fetch": lambda args: system_fetch(args),
+               "accumulate": False, "local": True, "metrics": ()},
 }
 
 
@@ -2191,6 +2236,279 @@ def wsman_fetch(args):
     raise SourceError("the wsman source only provides the inventory: use --list inventory or --get inventory")
 
 
+# --- system: the inventory of a computer itself, from system_profiler (macOS) or dmidecode (Linux) ---
+# Run on this computer, or on another one over ssh with --host (like lmsensors). dmidecode needs root, so it is tried as
+# is, then with `sudo -n` (never a password prompt); without either, Linux falls back to /sys/class/dmi/id for the
+# system and BIOS and leaves out the CPUs and memory. Disks come from lsblk, network ports from /sys/class/net and PCI
+# devices from lspci, none of which need root.
+SYSTEM_PROFILER_TYPES = ("SPHardwareDataType", "SPSoftwareDataType", "SPMemoryDataType", "SPNetworkDataType",
+                         "SPEthernetDataType", "SPNVMeDataType", "SPSerialATADataType", "SPDisplaysDataType",
+                         "SPPCIDataType")
+LINUX_NIC_COMMAND = ('for n in /sys/class/net/*; do [ -e "$n/device" ] || continue; '
+                     'd=$(readlink "$n/device/driver" 2>/dev/null); '
+                     'echo "$(basename "$n")|$(cat "$n/address" 2>/dev/null)|$(cat "$n/operstate" 2>/dev/null)|'
+                     '$(cat "$n/speed" 2>/dev/null)|${d##*/}"; done')
+LINUX_RAID_MODELS = re.compile(r"PERC|RAID|LOGICAL VOLUME|Virtual Disk", re.I)  # lsblk models of RAID volumes
+# lspci classes left out: the chipset's own bridges and internal functions (a Xeon has a hundred or more), not cards
+LINUX_PCI_SKIP = re.compile(r"bridge|System peripheral|Performance counters|Signal processing|PIC|Unassigned class", re.I)
+
+
+def system_run(args, command):
+    """Run a shell command on this computer, or on args.host over ssh: returns (exit status, stdout, stderr)."""
+    if args.remote:
+        return ssh_run(args, command)
+    try:
+        run = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise SourceError(f"{command.split()[0]} took too long")
+    return run.returncode, run.stdout, run.stderr
+
+
+def _bytes_gib(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return f"{num(round(n / 2 ** 30, 2))} GiB" if n > 0 else None
+
+
+def _sp(value, *prefixes):
+    """A system_profiler value with its internal prefix removed: 'sppci_vendor_Apple' -> 'Apple'."""
+    if value in (None, ""):
+        return None
+    text = str(value)
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            return text[len(prefix):].replace("_", " ")
+    return text
+
+
+def read_inventory_macos(args, want):
+    status, out, err = system_run(args, "system_profiler -json -detailLevel full " + " ".join(SYSTEM_PROFILER_TYPES))
+    if status != 0:
+        raise SourceError(f"system_profiler failed: {err.strip() or f'exit status {status}'}")
+    try:
+        data = json.loads(out)
+    except ValueError as e:
+        raise SourceError(f"system_profiler printed something that is not JSON: {e}")
+    hardware = (data.get("SPHardwareDataType") or [{}])[0]
+    software = (data.get("SPSoftwareDataType") or [{}])[0]
+    records = []
+    if want("system"):
+        model = " ".join(filter(None, [hardware.get("machine_name"),
+                                       f"({hardware['machine_model']})" if hardware.get("machine_model") else None]))
+        records.append(("system", "system", _rf(
+            ("model", model), ("name", args.host), ("service-tag", hardware.get("serial_number")),
+            ("manufacturer", "Apple"), ("os", software.get("os_version")), ("memory", _dmi_size(hardware.get("physical_memory"))))))
+    if want("bios"):
+        records.append(("bios", "bios", _rf(("version", hardware.get("boot_rom_version")), ("manufacturer", "Apple"))))
+    if want("cpu"):
+        cores = hardware.get("number_processors")
+        if isinstance(cores, str):  # Apple silicon: "proc 10:0:8:2", the total first
+            cores = (re.findall(r"\d+", cores) or [None])[0]
+        records.append(("cpu", hardware.get("chip_type") or hardware.get("cpu_type") or "cpu", _rf(
+            ("manufacturer", "Apple" if hardware.get("chip_type") else None),
+            ("brand", hardware.get("chip_type") or hardware.get("cpu_type")), ("cores", cores),
+            ("packages", hardware.get("packages")), ("speed", hardware.get("current_processor_speed")))))
+    if want("memory"):
+        for bank in data.get("SPMemoryDataType") or []:
+            if "_items" in bank:  # Intel Macs: one entry per DIMM
+                for dimm in bank["_items"]:
+                    if str(dimm.get("dimm_size", "")).lower() in ("", "empty"):
+                        continue
+                    records.append(("memory", dimm.get("_name"), _rf(
+                        ("size", _dmi_size(dimm.get("dimm_size"))), ("speed", _dmi_speed(dimm.get("dimm_speed"))), ("type", dimm.get("dimm_type")),
+                        ("manufacturer", dimm.get("dimm_manufacturer")), ("part-number", dimm.get("dimm_part_number")),
+                        ("serial", dimm.get("dimm_serial_number")), ("status", dimm.get("dimm_status")))))
+            else:  # Apple silicon: the memory is part of the chip, so there is one entry
+                records.append(("memory", "memory", _rf(
+                    ("size", _dmi_size(bank.get("SPMemoryDataType"))), ("type", bank.get("dimm_type")),
+                    ("manufacturer", bank.get("dimm_manufacturer")))))
+    if want("nic"):
+        ports = {e.get("spethernet_BSD_Device_Name"): e for e in data.get("SPEthernetDataType") or []}
+        for service in data.get("SPNetworkDataType") or []:
+            name = service.get("interface")
+            if not name:
+                continue
+            port = ports.get(name, {})
+            records.append(("nic", name, _rf(
+                ("product", port.get("spethernet_product_name") or service.get("_name")),
+                ("vendor", port.get("spethernet_vendor_name")),
+                ("mac", ((service.get("Ethernet") or {}).get("MAC Address") or port.get("spethernet_mac_address") or "").upper()),
+                ("type", service.get("type") or service.get("hardware")),
+                ("link", "connected" if (service.get("IPv4") or {}).get("Addresses") else None))))
+    for bus, key, media in (("nvme", "SPNVMeDataType", "ssd"), ("sata", "SPSerialATADataType", None)):
+        for controller in data.get(key) or []:
+            if want("controller"):
+                records.append(("controller", controller.get("_name"), _rf(("bus", bus))))
+            if want("disk"):
+                for disk in controller.get("_items") or []:
+                    kind = disk.get("spsata_medium_type", "")
+                    records.append(("disk", disk.get("bsd_name") or disk.get("_name"), _rf(
+                        ("model", disk.get("device_model") or disk.get("_name")), ("serial", disk.get("device_serial")),
+                        ("firmware", disk.get("device_revision")), ("size", _bytes_gib(disk.get("size_in_bytes"))),
+                        ("bus", bus), ("media", media or ("ssd" if "solid" in kind.lower() else "hdd" if kind else None)),
+                        ("status", disk.get("smart_status")))))
+    if want("pci"):
+        for gpu in data.get("SPDisplaysDataType") or []:
+            records.append(("pci", gpu.get("_name"), _rf(
+                ("manufacturer", _sp(gpu.get("spdisplays_vendor"), "sppci_vendor_")),
+                ("description", gpu.get("sppci_model")), ("type", _sp(gpu.get("sppci_device_type"), "spdisplays_")),
+                ("cores", gpu.get("sppci_cores")))))
+        for card in data.get("SPPCIDataType") or []:
+            records.append(("pci", card.get("_name"), _rf(
+                ("manufacturer", card.get("sppci_vendor-id")), ("description", card.get("sppci_name") or card.get("_name")),
+                ("type", card.get("sppci_device_type")), ("slot", card.get("sppci_slot_name")))))
+    return records
+
+
+def dmidecode_blocks(text):
+    """Parse dmidecode output into [(DMI type, {key: value})], leaving out the indented lists (Characteristics: ...)."""
+    blocks, current = [], None
+    for line in text.splitlines():
+        m = re.match(r"Handle 0x[0-9A-Fa-f]+, DMI type (\d+),", line)
+        if m:
+            current = {}
+            blocks.append((int(m.group(1)), current))
+        elif current is not None and line.startswith("\t") and not line.startswith("\t\t") and ":" in line:
+            key, value = line.strip().split(":", 1)
+            current[key.strip()] = value.strip()
+    return blocks
+
+
+def _dmi(value):
+    """A dmidecode value, or None for its placeholders."""
+    if not value or value.lower() in ("not specified", "unknown", "not provided", "to be filled by o.e.m.", "none",
+                                      "no module installed", "default string", "not available"):
+        return None
+    return value
+
+
+def _dmi_size(value):
+    """'16 GB' or '16384 MB' -> '16 GiB' (dmidecode's GB and MB are binary)."""
+    m = re.match(r"(\d+)\s*(MB|GB|TB)", value or "")
+    if not m:
+        return None
+    return f"{num(round(int(m.group(1)) / {'MB': 1024, 'GB': 1, 'TB': 1 / 1024}[m.group(2)], 2))} GiB"
+
+
+def _dmi_speed(value):
+    """'2400 MT/s' or '2400 MHz' -> '2400 MHz', as the other sources show it."""
+    m = re.match(r"(\d+)\s*(MT/s|MHz)", value or "")
+    return f"{m.group(1)} MHz" if m and int(m.group(1)) > 0 else None
+
+
+def read_inventory_linux(args, want):
+    records = []
+    if any(want(c) for c in ("system", "bios", "cpu", "memory")):
+        command = "dmidecode -t 0,1,4,17"
+        status, out, err = system_run(args, command)
+        if status != 0:
+            status, out, err = system_run(args, "sudo -n " + command)
+        if status == 0:
+            blocks = dmidecode_blocks(out)
+        else:
+            where = f"on {args.host}" if args.remote else "on this computer"
+            print(f"dmidecode needs root {where} and `sudo -n dmidecode` was refused: the CPUs and memory are left out, "
+                  "and the system and BIOS come from /sys/class/dmi/id", file=sys.stderr)
+            status, out, _ = system_run(args, "cd /sys/class/dmi/id && grep -s . sys_vendor product_name product_serial "
+                                              "bios_vendor bios_version bios_date")
+            sysfs = dict(line.split(":", 1) for line in out.splitlines() if ":" in line)
+            blocks = [(1, {"Manufacturer": sysfs.get("sys_vendor"), "Product Name": sysfs.get("product_name"),
+                           "Serial Number": sysfs.get("product_serial")}),
+                      (0, {"Vendor": sysfs.get("bios_vendor"), "Version": sysfs.get("bios_version"),
+                           "Release Date": sysfs.get("bios_date")})]
+        for kind, b in blocks:
+            if kind == 1 and want("system"):
+                records.append(("system", "system", _rf(
+                    ("model", _dmi(b.get("Product Name"))), ("name", args.host),
+                    ("service-tag", _dmi(b.get("Serial Number"))), ("manufacturer", _dmi(b.get("Manufacturer"))))))
+            elif kind == 0 and want("bios"):
+                records.append(("bios", "bios", _rf(
+                    ("version", _dmi(b.get("Version"))), ("released", _dmi(b.get("Release Date"))),
+                    ("manufacturer", _dmi(b.get("Vendor"))))))
+            elif kind == 4 and want("cpu") and "Populated" in b.get("Status", "Populated"):
+                records.append(("cpu", b.get("Socket Designation") or "cpu", _rf(
+                    ("manufacturer", _dmi(b.get("Manufacturer"))), ("brand", _dmi(b.get("Version"))),
+                    ("cores", _dmi(b.get("Core Count"))), ("enabled-cores", _dmi(b.get("Core Enabled"))),
+                    ("threads", _dmi(b.get("Thread Count"))), ("max-speed", _dmi_speed(b.get("Max Speed"))),
+                    ("speed", _dmi_speed(b.get("Current Speed"))))))
+            elif kind == 17 and want("memory") and _dmi_size(b.get("Size")):
+                records.append(("memory", b.get("Locator") or "memory", _rf(
+                    ("size", _dmi_size(b.get("Size"))), ("speed", _dmi_speed(b.get("Speed"))), ("type", _dmi(b.get("Type"))),
+                    ("manufacturer", _dmi(b.get("Manufacturer"))), ("part-number", _dmi(b.get("Part Number"))),
+                    ("serial", _dmi(b.get("Serial Number"))))))
+    if want("nic"):
+        status, out, _ = system_run(args, LINUX_NIC_COMMAND)
+        for line in out.splitlines():
+            name, mac, state, speed, driver = (line.split("|") + [""] * 5)[:5]
+            records.append(("nic", name, _rf(
+                ("mac", mac.upper()), ("link", {"up": "connected", "down": "disconnected"}.get(state, state or None)),
+                ("speed", f"{speed} Mb/s" if speed.isdigit() and int(speed) > 0 else None), ("driver", driver))))
+    if want("disk") or want("virtual-disk"):
+        status, out, _ = system_run(args, "lsblk -d -J -b -o NAME,TYPE,VENDOR,MODEL,SERIAL,REV,SIZE,TRAN,ROTA")
+        try:
+            devices = json.loads(out).get("blockdevices", []) if status == 0 else []
+        except ValueError:
+            devices = []
+        for d in devices:
+            if d.get("type") != "disk" or str(d.get("name", "")).startswith(("zram", "loop")) or not _bytes_gib(d.get("size")):
+                continue  # not a disk, or an empty drive (the iDRAC's virtual floppy and CD)
+            virtual = bool(LINUX_RAID_MODELS.search(d.get("model") or ""))  # a RAID controller's volume, not a disk
+            if not want("virtual-disk" if virtual else "disk"):
+                continue
+            rota = None if virtual else d.get("rota")  # the kernel calls every RAID volume rotational
+            records.append(("virtual-disk" if virtual else "disk", d.get("name"), _rf(
+                ("manufacturer", (d.get("vendor") or "").strip()), ("model", (d.get("model") or "").strip()),
+                ("serial", d.get("serial")), ("firmware", (d.get("rev") or "").strip()), ("size", _bytes_gib(d.get("size"))),
+                ("bus", d.get("tran")), ("media", None if rota is None else "hdd" if rota in (True, "1", 1) else "ssd"))))
+    if want("pci"):
+        status, out, _ = system_run(args, "lspci -mm")
+        for line in out.splitlines() if status == 0 else []:
+            try:
+                fields = [f for f in shlex.split(line) if not f.startswith("-")]
+            except ValueError:
+                continue
+            if len(fields) >= 4 and not LINUX_PCI_SKIP.search(fields[1]):
+                records.append(("pci", fields[0], _rf(("manufacturer", fields[2]), ("description", fields[3]),
+                                                      ("type", fields[1]))))
+    return records
+
+
+def read_inventory_system(args, only_category=None):
+    """Return the inventory (see read_inventory) of this computer, or of args.host over ssh."""
+    want = lambda category: only_category in (None, category)
+    if args.remote:
+        status, out, err = ssh_run(args, "uname -s")
+        if status != 0:
+            raise SourceError(f"uname failed on {args.host}: {err.strip()}")
+        system = out.strip()
+    else:
+        system = platform.system()
+    if system == "Darwin":
+        records = read_inventory_macos(args, want)
+    elif system == "Linux":
+        records = read_inventory_linux(args, want)
+    else:
+        raise SourceError(f"the system source supports macOS and Linux, not {system or 'this system'}")
+    order = {category: i for i, (category, *_) in enumerate(INVENTORY)}
+    records = [r for r in records if r[2]]  # an item with nothing known about it is left out
+    records.sort(key=lambda r: (order[r[0]], _natural(r[1] or "")))
+    if not records:
+        what = f"{only_category} items" if only_category else "inventory"
+        raise SourceError(f"no {what} found {'on ' + args.host if args.remote else 'on this computer'}")
+    return records
+
+
+def system_list(args):
+    """The system source has no sensors to list."""
+    return {}
+
+
+def system_fetch(args):
+    raise SourceError("the system source only provides the inventory: use --list inventory or --get inventory")
+
+
 INVENTORY_HEADER = ("CATEGORY", "NAME", "DETAILS")
 
 
@@ -2272,11 +2590,13 @@ def list_inventory(args):
     sub = copy.copy(args)
     # snmp is the default; redfish (and web, the iDRAC's web interface, which is where Redfish lives) use Redfish
     sub.source = args.source or "snmp"
-    if sub.source not in ("snmp", "redfish", "web", "racadm", "wsman"):
-        sys.exit(f"the inventory needs --source snmp, redfish, racadm or wsman, not {sub.source}")
+    if sub.source not in ("snmp", "redfish", "web", "racadm", "wsman", "system"):
+        sys.exit(f"the inventory needs --source snmp, redfish, racadm, wsman or system, not {sub.source}")
     try:
         if sub.source == "snmp":
             records = asyncio.run(read_inventory(sub, args.category))
+        elif sub.source == "system":
+            records = read_inventory_system(sub, args.category)
         elif sub.source == "wsman":
             if sys.stderr.isatty():
                 print("Reading the inventory over WS-Man: about 30 seconds on an iDRAC8...", file=sys.stderr)
@@ -2308,8 +2628,9 @@ def list_inventory(args):
 
 
 def list_all(args):
-    if args.source and not SOURCES[args.source]["metrics"] and args.list != "inventory":
-        sys.exit(f"the {args.source} source has no sensors, only the inventory: use --list inventory or --get inventory")
+    only_inventory = args.list if args.list in SOURCES else args.source
+    if only_inventory and not SOURCES[only_inventory]["metrics"] and args.list != "inventory":
+        sys.exit(f"the {only_inventory} source has no sensors, only the inventory: use --list inventory or --get inventory")
     """List every matching sensor in the chosen --output format (text by default); return an exit code."""
     if args.list == "inventory":
         return list_inventory(args)

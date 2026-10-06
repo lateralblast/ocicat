@@ -8,10 +8,37 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.4.9 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.5.1 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+## [0.5.1] - 2026-10-06
+
+### Added
+- `--source system` reads the hardware inventory of the computer ragdoll runs on (`--list inventory`, `--get inventory`):
+  `system_profiler -json` on macOS, and `dmidecode` on Linux. With `--host` it runs the same commands on another computer
+  over ssh, as `lmsensors` does (key or agent only, strict host keys). The categories and attributes are the same as the
+  iDRAC sources', so `--category`, `--name`, `--detail`, `--field` and every `--output` work with it.
+- macOS: `system`, `bios` (boot ROM), `cpu`, `memory`, `nic`, `pci` (GPU and PCI cards), `controller` and `disk`, in
+  about half a second.
+- Linux: `dmidecode` for `system`, `bios`, `cpu` and `memory`, run as is and then with `sudo -n`; if both are refused, the
+  system and BIOS come from `/sys/class/dmi/id` and a warning says the CPUs and memory are left out. `nic` from
+  `/sys/class/net` (physical ports), `disk` and `virtual-disk` (RAID volumes such as a PERC's) from `lsblk`, and `pci` from
+  `lspci` without bridges and chipset functions (16 items instead of 215 on a dual-socket R630). About a second over ssh.
+
+### Changed
+- `--list redfish` (and any other inventory-only source given to `--list`) now says the source has only the inventory,
+  instead of printing nothing.
+- The ssh runner used by `lmsensors` (`ssh_run`) takes any command, so other sources can use it.
+
+## [0.5.0] - 2026-10-06
+
+### Added
+- Missing Python modules are installed at startup: ragdoll checks every module from `requirements.txt` with
+  `importlib.util.find_spec` (which imports nothing, so the check adds no time) and runs `python3 -m pip install` for the
+  missing ones, with the interpreter that is running it, adding `--user` for a system Python it cannot write to.
+- `--no-install`, or `RAGDOLL_NO_INSTALL=1`, turns it off. A failed install prints a warning with the command to run.
 
 ## [0.4.9] - 2026-10-06
 

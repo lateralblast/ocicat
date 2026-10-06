@@ -28,6 +28,11 @@ This installs `requests` (web source), `pysnmp` (snmp source), `paramiko` (ssh, 
 output), `XlsxWriter` and `xlwt` (`.xlsx` and `.xls` output), and the two graphing modules, `plotext` and `termgraph`.
 `plotext` is pinned to 5.3.2 because 6.x has a different API.
 
+If any of these modules is missing when ragdoll starts, it installs them itself with `python3 -m pip install` (the pip of
+the Python running it, with `--user` for a system Python it cannot write to) and says so on stderr. `--no-install`, or
+`RAGDOLL_NO_INSTALL=1` in the environment, turns this off. If pip fails (for example on a Python marked as externally
+managed), ragdoll prints a warning and carries on; use a virtual environment there.
+
 The `lmsensors` source also needs the `lm-sensors` package, which is a system package and not a Python one (for example
 `sudo apt install lm-sensors`, then `sudo sensors-detect` once to find the hardware). Nothing else needs it.
 
@@ -51,7 +56,7 @@ Credentials do not have to be typed each time: see [Credentials](#credentials).
 
 ## Sources and metrics
 
-ragdoll reads from six sources, chosen with `--source` (`gui` is accepted as another name for `web`):
+ragdoll reads from seven sources, chosen with `--source` (`gui` is accepted as another name for `web`):
 
 | Source | Metrics | How it works | History |
 |---|---|---|---|
@@ -60,6 +65,7 @@ ragdoll reads from six sources, chosen with `--source` (`gui` is accepted as ano
 | `wsman` | none: the [hardware inventory](#hardware-inventory) only | Reads part of the inventory over WS-Man (HTTPS) with the `python-dracclient` module: no ssh and no racadm | The inventory is a snapshot, so there is no history |
 | `racadm` | none: the [hardware inventory](#hardware-inventory) only | Runs Dell's `racadm` commands (`hwinventory`, `swinventory`, `getsysinfo`) in the iDRAC's ssh shell | The inventory is a snapshot, so there is no history |
 | `redfish` | none: the [hardware inventory](#hardware-inventory) only | Reads the inventory from the iDRAC's Redfish API over HTTPS | The inventory is a snapshot, so there is no history |
+| `system` | none: the [hardware inventory](#hardware-inventory) only | Reads the inventory of the computer ragdoll runs on (or `--host` over ssh) with `system_profiler` on macOS and `dmidecode` on Linux | The inventory is a snapshot, so there is no history |
 | `snmp` | temperature, fan, power, voltage, health, network | Reads the current value from the Dell probe tables (and the standard interface counters) over SNMP v2c | Only the current value; each run appends a reading to the local cache, so history builds up over time |
 
 `--metric` chooses what to read (default `temperature`) and `--sensor` picks one sensor of that metric. Every metric
@@ -303,6 +309,41 @@ python3 ragdoll.py --host 192.0.2.20 --source wsman --get inventory --category c
   (it fails on a self-signed certificate, as you would expect) and a request is given up after 60 seconds.
 - **Install:** `pip install python-dracclient six`. The module imports `six` without declaring it, so it must be installed
   as well. Without the module the source says so and how to install it.
+
+**This computer.** `--source system` reads the inventory of the computer ragdoll runs on: `system_profiler` on macOS,
+and `dmidecode` on Linux. Like `lmsensors`, it needs no `--host` and no login, and with `--host` (and `--user`) it runs
+the same commands on that computer over ssh, with the same rules: a key or the ssh agent, never a password, and host keys
+checked strictly against `~/.ssh/known_hosts`. The categories and attribute names are the same as for an iDRAC.
+
+```
+python3 ragdoll.py --source system --list inventory
+python3 ragdoll.py --source system --host 192.0.2.30 --user <user> --get inventory --category memory
+```
+
+```
+CATEGORY    NAME                  DETAILS
+system      system                model=MacBook Pro (MacBookPro18,4); name=example.local; service-tag=XXXXXXXXXX; manufacturer=Apple; os=macOS 27.2 (26B5101f); memory=64 GiB
+bios        bios                  version=20457.40.172.501.1; manufacturer=Apple
+cpu         Apple M1 Max          manufacturer=Apple; brand=Apple M1 Max; cores=10
+memory      memory                size=64 GiB; type=LPDDR5; manufacturer=Hynix
+nic         en7                   product=USB 10/100/1G/2.5G LAN; vendor=Realtek; mac=XX:XX:XX:XX:XX:XX; type=Ethernet; link=connected
+pci         Apple M1 Max          manufacturer=Apple; description=Apple M1 Max; type=gpu; cores=24
+controller  Apple SSD Controller  bus=nvme
+disk        disk0                 model=APPLE SSD AP1024R; serial=XXXXXXXXXX; firmware=591.40.3; size=931.84 GiB; bus=nvme; media=ssd; status=Verified
+```
+
+- **macOS:** one `system_profiler -json` call (about half a second) gives `system`, `bios` (the boot ROM), `cpu`,
+  `memory`, `nic`, `pci` (the GPU, and PCI cards on Macs that have slots), `controller` and `disk`. On Apple silicon the
+  memory is part of the chip, so it is one item with no slots.
+- **Linux:** `dmidecode` gives `system`, `bios`, `cpu` (one item per socket) and `memory` (one per DIMM, named by its slot,
+  such as `A1`). It needs root, so ragdoll runs it as is and then with `sudo -n` (which never asks for a password). If
+  both are refused it says so, takes the system and BIOS from `/sys/class/dmi/id` (without the serial number, which only
+  root can read) and leaves out the CPUs and memory. Network ports come from `/sys/class/net` (physical ports only, with
+  link, speed and driver), disks from `lsblk` (a RAID controller's volumes, such as a PERC's, are listed as `virtual-disk`,
+  and empty drives such as the iDRAC's virtual floppy are left out) and `pci` from `lspci`, without the chipset's
+  bridges and internal functions. None of these need root. About a second over ssh for a dual-socket server.
+- It provides the inventory only: a chart, `--list` of sensors, `--get` of a sensor or `--tail` is rejected with a message
+  pointing to the inventory.
 
 **Redfish is slow on an iDRAC8.** With a password, every request takes 5 to 9 seconds, because the iDRAC checks it
 each time. ragdoll therefore logs in once with a session token (about 10 seconds), after which each request takes under
@@ -820,8 +861,8 @@ A systemd service or a terminal multiplexer is a good place to run it. For one r
 
 | Option | What it does |
 |---|---|
-| `--host HOST` | the iDRAC's address (required, except with `--source lmsensors`: without it this computer is read, with it that computer over ssh) |
-| `--source web\|snmp\|redfish\|racadm\|wsman\|lmsensors` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get`, `--tail` and for the inventory. `redfish` (and `web`) read the inventory over Redfish, `racadm` with racadm, `wsman` over WS-Man; `lmsensors` reads this computer |
+| `--host HOST` | the iDRAC's address (required, except with `--source lmsensors` or `system`: without it this computer is read, with it that computer over ssh) |
+| `--source web\|snmp\|redfish\|racadm\|wsman\|lmsensors\|system` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get`, `--tail` and for the inventory. `redfish` (and `web`) read the inventory over Redfish, `racadm` with racadm, `wsman` over WS-Man; `lmsensors` reads this computer's sensors and `system` its inventory |
 | `--metric M` | `temperature`, `fan`, `power`, `voltage`, `health` or `network`; default `temperature` |
 | `--sensor S` | which sensor of the metric; the default depends on the metric |
 | `--list [sensors\|inventory\|SOURCE\|METRIC]` | list the sensors, or the hardware inventory, and exit |
@@ -999,7 +1040,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
 
 ## Version
 
-Current version: **0.4.9**. Print it with `python3 ragdoll.py --version`.
+Current version: **0.5.1**. Print it with `python3 ragdoll.py --version`.
 
 Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
