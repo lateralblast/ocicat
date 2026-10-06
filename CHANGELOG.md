@@ -8,10 +8,51 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.3.5 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.3.8 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+## [0.3.8] - 2026-10-06
+
+### Added
+- `--category CATEGORY` limits `--list inventory` and `--get inventory` to one category (`system`, `idrac`, `bios`,
+  `firmware`, `cpu`, `memory`, `nic`, `pci`, `controller`, `disk`, `virtual-disk`, `raid-battery`). Only that
+  category's tables are read, so it is faster than the whole inventory (2 s against 5 s on the test server).
+- `--name NAME` limits it to the items with that name, for example `--name DIMM.Socket.A1`. It is not
+  case-sensitive and `*` and `?` are wildcards. With `--category` it narrows that category; without, it looks in
+  every category.
+- A name that matches nothing is rejected with the names that exist, and an unknown category with the valid ones.
+  Both flags are rejected without `--list inventory` or `--get inventory`.
+- Inventory spreadsheets are named after the filters, for example `<host>_inventory_memory_DIMM.Socket.A1.xlsx`.
+
+## [0.3.7] - 2026-10-06
+
+### Added
+- `--get inventory` prints the hardware inventory, exactly the same as `--list inventory`, in every `--output`
+  format. Plain `--get` still reads one sensor.
+
+### Changed
+- `--get` now takes an optional value. Any word other than `inventory` is rejected with a message pointing to
+  `--metric` and `--sensor`.
+- The inventory is also rejected when `--sensor` is given (it already rejected `--metric`), and its error messages no
+  longer say "--list".
+
+## [0.3.6] - 2026-10-06
+
+### Added
+- `--list inventory` lists the hardware over SNMP: system, iDRAC, BIOS and firmware, CPUs, memory modules, network
+  ports, PCI devices, storage controllers, disks, virtual disks and the RAID battery (66 items, 314 attributes on the
+  test server). Sizes are in GiB, speeds in MHz, MAC addresses are shown as `24:6E:...`, and status and state values
+  are shown as words (`ok`, `online`, `RAID 5`).
+- It works with `--output text|table|csv|xlsx|xls`. `text` and `table` give one row per item; `csv`, `xlsx` and `xls`
+  give one row per attribute (`category,name,attribute,value`). A spreadsheet is named `<host>_inventory.xlsx` unless
+  `--file` is given.
+- `--list inventory` is rejected with `--source web` and with `--metric`, and `--save-credentials` with it saves for snmp.
+
+### Changed
+- The text, table, CSV and spreadsheet writers for `--list` now share common code that the inventory listing also
+  uses. The sensor listings are unchanged.
 
 ### Changed
 - The README is restructured. Features are grouped by task (sources and metrics, listing, getting a value, charts,

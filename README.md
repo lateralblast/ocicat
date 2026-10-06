@@ -171,6 +171,71 @@ $ python3 ragdoll.py --host 192.0.2.20 --source snmp --metric fan --list --outpu
 Wrote 14 sensors to 192.0.2.20_sensors_snmp_fan.xlsx
 ```
 
+### Hardware inventory
+
+`--list inventory` lists what the server is made of, over SNMP. Unlike a sensor, none of it changes between polls, so it
+is a snapshot rather than a metric. It needs `--source snmp` (the default for this listing); `--source web` and
+`--metric` are rejected.
+
+| Category | What it shows |
+|---|---|
+| `system`, `idrac` | the server's model, name and service tag; the iDRAC's product, firmware and manufacturer |
+| `bios`, `firmware` | BIOS version and date; firmware versions (the iDRAC, the Lifecycle Controller) |
+| `cpu` | manufacturer, brand, model, cores, threads, maximum and current speed, status |
+| `memory` | each module's size, speed, manufacturer, part number, serial number and status |
+| `nic`, `pci` | network ports (product, vendor, MAC address, link state) and PCI devices |
+| `controller`, `disk`, `virtual-disk`, `raid-battery` | the storage: controller firmware and cache; each disk's model, serial number, firmware, size, bus, media, state and status; each virtual disk's size, RAID layout and state; the RAID battery |
+
+Status values are `ok`, `non-critical`, `critical` and so on, as in the health metric. Sizes are in GiB and speeds in
+MHz. Items are in category order and, within a category, in natural order (`DIMM.Socket.A2` before `A10`).
+
+```
+$ python3 ragdoll.py --host 192.0.2.20 --list inventory
+CATEGORY      NAME                                     DETAILS
+system        system                                   model=PowerEdge R630; name=r630xp1; service-tag=XXXXXXX
+idrac         idrac                                    product=iDRAC8; firmware=2.86.86.86; manufacturer=Dell Inc.
+bios          bios                                     version=2.19.0; released=12/12/2023; manufacturer=Dell Inc.; status=ok
+firmware      iDRAC8                                   version=2.86.86.86; status=ok
+firmware      Lifecycle Controller 3                   version=2.86.86.86; status=ok
+memory        DIMM.Socket.A1                           size=32 GiB; speed=2133 MHz; manufacturer=Samsung; part-number=M386A4G40DM0-CPB; serial=XXXXXXXX; status=ok
+controller    PCIe Extender 1 (PCI Slot 1)             firmware=1; status=ok
+controller    PERC H730P Mini (Embedded)               firmware=25.5.9.0001; cache=2048 MB; status=ok
+disk          Solid State Disk 0:1:0                   manufacturer=ATA; model=TOSHIBA THNSN89; firmware=8EET6101; size=893.75 GiB; bus=sata; media=ssd; state=online; status=ok
+virtual-disk  boot                                     size=893.75 GiB; layout=RAID 1; media=SSD; state=online; status=ok
+virtual-disk  data                                     size=6256.25 GiB; layout=RAID 5; media=SSD; state=online; status=ok
+raid-battery  Battery on Integrated RAID Controller 1  state=ready; status=ok
+```
+
+(Only some of the 66 rows are shown. The service tag, serial numbers and MAC addresses are replaced here with
+`XXXX`; the real listing includes them, so take care when sharing it.)
+
+`--get inventory` produces exactly the same listing as `--list inventory`, in every format.
+
+**Choosing part of the inventory.** `--category` limits it to one category (`system`, `idrac`, `bios`, `firmware`,
+`cpu`, `memory`, `nic`, `pci`, `controller`, `disk`, `virtual-disk` or `raid-battery`), and `--name` limits it to the
+items with that name. They can be used together, and they work with `--list inventory` and `--get inventory`:
+
+```
+$ python3 ragdoll.py --host 192.0.2.20 --get inventory --category memory --name DIMM.Socket.A1
+CATEGORY  NAME            DETAILS
+memory    DIMM.Socket.A1  size=32 GiB; speed=2133 MHz; manufacturer=Samsung; part-number=M386A4G40DM0-CPB; serial=XXXXXXXX; status=ok
+```
+
+- `--category memory` alone lists every memory module. Only that category's tables are read, so it is quicker than the
+  whole inventory (2 seconds against 5 on the test server).
+- `--name` is not case-sensitive, and `*` and `?` match any characters: `--name 'DIMM.Socket.B*'` is every module in
+  bank B. Without `--category` it looks in every category, so `--name NIC.Integrated.1-1-1` finds both the network port
+  and the PCI device of that name.
+- A name that matches nothing is rejected with the names that do exist. An unknown category is rejected with the valid
+  ones. Both flags are rejected without `--list inventory` or `--get inventory`.
+- A spreadsheet is named after the filters: `<host>_inventory_memory.xlsx`,
+  `<host>_inventory_memory_DIMM.Socket.A1.xlsx` (a `*` in the name becomes `_`).
+
+`--output` works as for sensors, with one difference: `text` and `table` show one row per item, with its details
+joined as `attribute=value`, while `csv`, `xlsx` and `xls` are tidy, one row per attribute (`category`, `name`,
+`attribute`, `value`), which suits filtering and pivot tables. A spreadsheet is named `<host>_inventory.xlsx` (or
+`.xls`) unless `--file` is given.
+
 ## Getting a current value
 
 `--get` polls one SNMP sensor now and prints its current value and unit, which is handy for a quick look or a script.
@@ -199,6 +264,8 @@ $ python3 ragdoll.py --host 192.0.2.20 --metric health --sensor system --get
   `--list` would; `--file` names a spreadsheet. `--output text` is the default.
 - **Only SNMP:** the web source cannot give a live value without fetching its whole history, so `--source web` is
   rejected. `--get` cannot be combined with `--list` or `--no-fetch`.
+- **Inventory:** `--get inventory` prints the [hardware inventory](#hardware-inventory), the same as
+  `--list inventory`. It takes no `--metric` or `--sensor`, and any other word after `--get` is rejected.
 
 ## Charts
 
@@ -431,8 +498,9 @@ horizontal`; for just the current value, use [`--get`](#getting-a-current-value)
 | `--source web\|snmp` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get` |
 | `--metric M` | `temperature`, `fan`, `power`, `voltage`, `health` or `network`; default `temperature` |
 | `--sensor S` | which sensor of the metric; the default depends on the metric |
-| `--list [sensors\|SOURCE\|METRIC]` | list the sensors and exit |
-| `--get` | print one sensor's current value over SNMP and exit |
+| `--list [sensors\|inventory\|SOURCE\|METRIC]` | list the sensors, or the hardware inventory, and exit |
+| `--get [inventory]` | print one sensor's current value over SNMP, or with `inventory` the hardware inventory, and exit |
+| `--category C`, `--name N` | with `--list inventory` or `--get inventory`: only that category, or only the items with that name (wildcards allowed) |
 | `--user`/`--username`, `--pass`/`--password` | web credentials |
 | `--community` | SNMP v2c community string |
 | `--save-credentials`, `--forget-credentials` | keep or remove this host's credentials in the OS keyring |
@@ -601,7 +669,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
 
 ## Version
 
-Current version: **0.3.5**. Print it with `python3 ragdoll.py --version`.
+Current version: **0.3.8**. Print it with `python3 ragdoll.py --version`.
 
 Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.

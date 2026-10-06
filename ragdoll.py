@@ -12,6 +12,7 @@ import asyncio
 import calendar
 import collections
 import contextlib
+import fnmatch
 import copy
 import csv
 import datetime as dt
@@ -32,7 +33,7 @@ from pathlib import Path
 import requests
 import urllib3
 
-__version__ = "0.3.5"
+__version__ = "0.3.8"
 
 
 class SourceError(Exception):
@@ -98,6 +99,134 @@ HEALTH_TABLES = [
     (f"{DELL}.5.1.20.130.15.1", 21, 6, lambda n: "raid-battery"),
     (f"{DELL}.5.1.20.130.1.1", 2, 38, _clean),  # storage controllers
 ]
+
+
+# --- inventory: the static description of the hardware, read from Dell's tables (none of it changes between polls) ---
+STATUS_NAMES = {1: "other", 2: "unknown", 3: "ok", 4: "non-critical", 5: "critical", 6: "non-recoverable"}
+LINK_NAMES = {1: "connected", 2: "disconnected", 3: "driver bad", 4: "driver disabled", 10: "hardware initializing",
+              11: "hardware resetting", 12: "hardware closing", 13: "hardware not ready"}
+BUS_NAMES = {1: "unknown", 2: "scsi", 3: "sas", 4: "sata", 5: "fibre", 6: "pcie", 7: "nvme"}
+MEDIA_NAMES = {1: "unknown", 2: "hdd", 3: "ssd"}
+LAYOUT_NAMES = {1: "other", 2: "RAID 0", 3: "RAID 1", 4: "RAID 5", 5: "RAID 6", 6: "RAID 10", 7: "RAID 50", 8: "RAID 60",
+                9: "concat RAID 1", 10: "concat RAID 5"}
+DISK_STATE_NAMES = {1: "unknown", 2: "ready", 3: "online", 4: "foreign", 5: "offline", 6: "blocked", 7: "failed",
+                    8: "non-raid", 9: "removed", 10: "read-only"}
+VDISK_STATE_NAMES = {1: "unknown", 2: "online", 3: "failed", 4: "degraded"}
+BATTERY_STATE_NAMES = {1: "unknown", 2: "ready", 3: "failed", 4: "degraded", 5: "missing", 6: "charging",
+                       7: "below threshold"}
+
+
+def _text(value):
+    return str(value).strip().strip('"') or None
+
+
+def _mac(value):
+    """A MAC address arrives as six raw bytes; show it as 24:6E:96:74:E1:EC."""
+    raw = bytes(value.asOctets()) if hasattr(value, "asOctets") else b""
+    return ":".join(f"{b:02X}" for b in raw) if len(raw) == 6 else _text(value)
+
+
+def _natural(text):
+    """Sort key that orders 'DIMM.Socket.A2' before 'DIMM.Socket.A10'."""
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
+
+
+def _enum(names):
+    return lambda value: names.get(int(value), str(value))
+
+
+def _gib(per_gib):
+    """Size in GiB from a value in KiB (per_gib 1048576) or MiB (per_gib 1024); 0 or unknown means not present."""
+    def convert(value):
+        n = int(value)
+        return None if n <= 0 or n == 2147483647 else f"{num(round(n / per_gib, 2))} GiB"
+    return convert
+
+
+def _mhz(value):
+    return f"{int(value)} MHz" if int(value) > 0 else None
+
+
+def _mb(value):
+    return f"{int(value)} MB" if int(value) > 0 else None
+
+
+# Each inventory category: (category, table OID, column holding the item's name or None for a fixed name,
+# {attribute: (column, how to show it)}). Scalar groups (system, idrac) have no table; their columns are the scalars.
+INVENTORY = [
+    ("system", f"{DELL}.1.3", None, {"model": (12, _text), "name": (1, _text), "service-tag": (2, _text)}),
+    ("idrac", f"{DELL}.1.1", None, {"product": (2, _text), "firmware": (8, _text), "manufacturer": (4, _text)}),
+    ("bios", f"{DELL}.4.300.50.1", None,
+     {"version": (8, _text), "released": (7, _text), "manufacturer": (11, _text), "status": (5, _enum(STATUS_NAMES))}),
+    ("firmware", f"{DELL}.4.300.60.1", 8, {"version": (11, _text), "status": (5, _enum(STATUS_NAMES))}),
+    ("cpu", f"{DELL}.4.1100.30.1", 26,
+     {"manufacturer": (8, _text), "brand": (23, _text), "model": (16, _text), "cores": (17, _text),
+      "enabled-cores": (18, _text), "threads": (19, _text), "max-speed": (11, _mhz), "speed": (12, _mhz),
+      "status": (5, _enum(STATUS_NAMES))}),
+    ("memory", f"{DELL}.4.1100.50.1", 8,
+     {"size": (14, _gib(1048576)), "speed": (15, _mhz), "manufacturer": (21, _text), "part-number": (22, _text),
+      "serial": (23, _text), "status": (5, _enum(STATUS_NAMES))}),
+    ("nic", f"{DELL}.4.1100.90.1", 30,
+     {"product": (6, _text), "vendor": (7, _text), "mac": (16, _mac), "link": (4, _enum(LINK_NAMES)),
+      "status": (3, _enum(STATUS_NAMES))}),
+    ("pci", f"{DELL}.4.1100.80.1", 12,
+     {"manufacturer": (8, _text), "description": (9, _text), "status": (5, _enum(STATUS_NAMES))}),
+    ("controller", f"{DELL}.5.1.20.130.1.1", 2,
+     {"firmware": (8, _text), "cache": (9, _mb), "status": (38, _enum(STATUS_NAMES))}),
+    ("disk", f"{DELL}.5.1.20.130.4.1", 2,
+     {"manufacturer": (3, _text), "model": (6, _text), "serial": (7, _text), "firmware": (8, _text),
+      "size": (11, _gib(1024)), "bus": (21, _enum(BUS_NAMES)), "media": (35, _enum(MEDIA_NAMES)),
+      "state": (4, _enum(DISK_STATE_NAMES)), "status": (24, _enum(STATUS_NAMES))}),
+    ("virtual-disk", f"{DELL}.5.1.20.140.1.1", 2,
+     {"size": (6, _gib(1024)), "layout": (13, _enum(LAYOUT_NAMES)), "media": (33, _text),
+      "state": (4, _enum(VDISK_STATE_NAMES)), "status": (20, _enum(STATUS_NAMES))}),
+    ("raid-battery", f"{DELL}.5.1.20.130.15.1", 21,
+     {"state": (4, _enum(BATTERY_STATE_NAMES)), "status": (6, _enum(STATUS_NAMES))}),
+]
+
+
+async def read_inventory(args, only_category=None):
+    """Return [(category, item name, [(attribute, shown value), ...])] in category order.
+
+    only_category limits it to one category, and then only that category's tables are read.
+    """
+    specs = [entry for entry in INVENTORY if only_category in (None, entry[0])]
+    limit = asyncio.Semaphore(6)  # many walks at once, but not so many that the iDRAC drops requests
+
+    async def walk(oid):
+        async with limit:
+            return await snmp_walk(args, oid)
+
+    await snmp_connection(args)  # created before any concurrent walks start
+    try:
+        walks = await asyncio.gather(*(
+            asyncio.gather(*(walk(f"{table}.{c}") for c in
+                             ([name_column] if name_column else []) + [col for col, _ in attributes.values()]))
+            for _, table, name_column, attributes in specs))
+    finally:
+        snmp_close(args)
+    records = []
+    for (category, table, name_column, attributes), columns in zip(specs, walks):
+        names = columns[0] if name_column else None
+        values = columns[1 if name_column else 0:]
+        rows = sorted(names) if name_column else sorted({row for col in values for row in col}) or []
+        for row in rows:
+            details = []
+            for (attribute, (_, show)), column in zip(attributes.items(), values):
+                if row in column:
+                    shown = show(column[row])
+                    if shown:
+                        details.append((attribute, shown))
+            if not details:
+                continue
+            name = _text(names[row]) if name_column else category
+            records.append((category, name or f"{category}-{row}", details))
+    order = {category: i for i, (category, *_) in enumerate(INVENTORY)}
+    records.sort(key=lambda r: (order[r[0]], _natural(r[1])))  # categories as defined, items in natural order
+    if not records:
+        what = f"{only_category} items" if only_category else "inventory"
+        raise SourceError(f"no {what} returned by {args.host} (check host and --community)")
+    return records
 
 
 def probe_unit(sensor):
@@ -447,15 +576,23 @@ def parse_args():
                         "codes) or network (bytes per second); all but temperature need --source snmp "
                         "(default: temperature; with --list, all metrics)")
     p.add_argument("--sensor", help="sensor to graph, see --list (default: inlet, fan1a or system-power depending on --metric)")
-    p.add_argument("--get", action="store_true",
+    p.add_argument("--get", nargs="?", const="sensor", metavar="inventory",
                    help="poll one snmp sensor now and print its current value, for example 16 °C; nothing is "
                         "stored. Uses --source snmp by default, with --metric and --sensor choosing the sensor "
-                        "(network counters are sampled twice, 2 seconds apart, to give bytes per second)")
-    p.add_argument("--list", nargs="?", const="all", metavar="sensors|SOURCE|METRIC",
+                        "(network counters are sampled twice, 2 seconds apart, to give bytes per second). "
+                        "--get inventory prints the hardware inventory, the same as --list inventory")
+    p.add_argument("--category", choices=[entry[0] for entry in INVENTORY], metavar="CATEGORY",
+                   help="with --list inventory or --get inventory: only this category of the inventory ("
+                        + ", ".join(entry[0] for entry in INVENTORY) + ")")
+    p.add_argument("--name", metavar="NAME",
+                   help="with --list inventory or --get inventory: only the items with this name, for example "
+                        "DIMM.Socket.A1; not case-sensitive, and * and ? match any characters")
+    p.add_argument("--list", nargs="?", const="all", metavar="sensors|inventory|SOURCE|METRIC",
                    help="list the available sensors and exit: sensors (the default) lists every sensor of every "
                         "source and metric, with its source; or give a source (web, snmp) or a metric "
                         "(temperature, fan, power, voltage, health, network) to list only those; "
-                        "--source and --metric also narrow the listing")
+                        "inventory lists the hardware (CPUs, memory, disks, firmware ...) over snmp; "
+                        "--source and --metric also narrow the sensor listing")
     p.add_argument("--secure", action="store_true",
                    help="verify the TLS certificate (iDRACs are usually self-signed, so off by default)")
     p.add_argument("--cachedir", "--cache-dir", dest="cache_dir", type=Path, default=default_cache_dir(),
@@ -502,6 +639,10 @@ def parse_args():
     args = p.parse_args()
     if args.tz and args.utc:
         p.error("--tz and --utc cannot be used together")
+    if args.get not in (None, "sensor", "inventory"):
+        p.error(f"--get takes no value or 'inventory', not {args.get!r}; use --metric and --sensor to choose a sensor")
+    if (args.category or args.name) and "inventory" not in (args.list, args.get):
+        p.error("--category and --name only apply to --list inventory or --get inventory")
     if args.list and args.get:
         p.error("--list and --get cannot be used together")
     if args.list or args.get:  # plain text unless another format is asked for
@@ -1084,31 +1225,90 @@ def list_data_rows(records):
     return head, rows
 
 
-def list_text(args, records):
-    """The default: aligned columns of plain text, with VALUE right-aligned."""
-    rows = list_display_rows(records)
-    widths = [max(len(r[i]) for r in [LIST_HEADER] + rows) for i in range(len(LIST_HEADER) - 1)]
-    for row in [LIST_HEADER] + rows:
-        cells = [c.rjust(w) if i == 4 else c.ljust(w) for i, (c, w) in enumerate(zip(row, widths))]
+def emit_text(head, rows, right=()):
+    """Aligned columns of plain text. The last column is not padded; columns listed in right are right-aligned."""
+    widths = [max(len(r[i]) for r in [head] + rows) for i in range(len(head) - 1)]
+    for row in [head] + rows:
+        cells = [c.rjust(w) if i in right else c.ljust(w) for i, (c, w) in enumerate(zip(row, widths))]
         print("  ".join(cells) + "  " + row[-1])
 
 
-def list_table(args, records):
+def emit_table(head, rows, right=()):
+    """A bordered table using terminaltables (plain ASCII, so it survives pipes and redirects)."""
     try:
         from terminaltables import AsciiTable
     except ImportError:
         sys.exit("terminaltables not found; install with: pip install terminaltables")
-    table = AsciiTable([list(LIST_HEADER)] + [list(r) for r in list_display_rows(records)])
-    table.justify_columns = {4: "right"}
+    table = AsciiTable([list(head)] + [list(r) for r in rows])
+    table.justify_columns = {i: "right" for i in right}
     print(table.table)
 
 
-def list_csv(args, records):
-    head, rows = list_data_rows(records)
+def emit_csv(head, rows):
     writer = csv.writer(sys.stdout, lineterminator="\n")
     writer.writerow(head)
     for row in rows:
         writer.writerow(["" if v is None else num(v) if isinstance(v, (int, float)) else v for v in row])
+
+
+def column_width(heading, values):
+    """Width in characters for a spreadsheet column: the longest of the heading and the values, plus a margin."""
+    return max([len(heading)] + [len(str(v)) for v in values if v is not None]) + 2
+
+
+def emit_spreadsheet(kind, path, sheet_name, head, rows, noun):
+    """Write head and rows to an .xlsx or .xls workbook with one sheet; a None cell is left empty."""
+    if kind == "xlsx":
+        try:
+            import xlsxwriter
+        except ImportError:
+            sys.exit("XlsxWriter not found; install with: pip install XlsxWriter")
+        try:
+            with xlsxwriter.Workbook(path) as book:
+                sheet = book.add_worksheet(sheet_name)
+                sheet.write_row(0, 0, head, book.add_format({"bold": True}))
+                for r, row in enumerate(rows, start=1):
+                    for c, v in enumerate(row):
+                        if v is not None:
+                            sheet.write(r, c, v)
+                for c, h in enumerate(head):
+                    sheet.set_column(c, c, column_width(h, [row[c] for row in rows]))
+                sheet.freeze_panes(1, 0)
+        except (OSError, xlsxwriter.exceptions.XlsxWriterException) as e:
+            sys.exit(f"Could not write {path}: {e}")
+    else:
+        try:
+            import xlwt
+        except ImportError:
+            sys.exit("xlwt not found; install with: pip install xlwt")
+        book = xlwt.Workbook()
+        sheet = book.add_sheet(sheet_name)
+        bold = xlwt.easyxf("font: bold on")
+        for c, h in enumerate(head):
+            sheet.write(0, c, h, bold)
+            sheet.col(c).width = 256 * column_width(h, [row[c] for row in rows])
+        for r, row in enumerate(rows, start=1):
+            for c, v in enumerate(row):
+                if v is not None:
+                    sheet.write(r, c, v)
+        try:
+            book.save(str(path))
+        except OSError as e:
+            sys.exit(f"Could not write {path}: {e}")
+    print(f"Wrote {len(rows)} {noun}{'s' if len(rows) != 1 else ''} to {path}")
+
+
+def list_text(args, records):
+    """The default: aligned columns of plain text, with VALUE right-aligned."""
+    emit_text(list(LIST_HEADER), list_display_rows(records), right=(4,))
+
+
+def list_table(args, records):
+    emit_table(LIST_HEADER, list_display_rows(records), right=(4,))
+
+
+def list_csv(args, records):
+    emit_csv(*list_data_rows(records))
 
 
 def list_spreadsheet_path(args, extension):
@@ -1122,63 +1322,81 @@ def list_spreadsheet_path(args, extension):
     return Path("_".join([safe(args.host), "sensors"] + [safe(p) for p in (source, metric) if p]) + extension)
 
 
-def column_width(heading, values):
-    """Width in characters for a spreadsheet column: the longest of the heading and the values, plus a margin."""
-    return max([len(heading)] + [len(str(v)) for v in values if v is not None]) + 2
-
-
 def list_xlsx(args, records):
-    try:
-        import xlsxwriter
-    except ImportError:
-        sys.exit("XlsxWriter not found; install with: pip install XlsxWriter")
-    path = list_spreadsheet_path(args, ".xlsx")
     head, rows = list_data_rows(records)
-    try:
-        with xlsxwriter.Workbook(path) as book:
-            sheet = book.add_worksheet("Sensors")
-            sheet.write_row(0, 0, head, book.add_format({"bold": True}))
-            for r, row in enumerate(rows, start=1):
-                for c, v in enumerate(row):
-                    if v is not None:
-                        sheet.write(r, c, v)
-            for c, h in enumerate(head):
-                sheet.set_column(c, c, column_width(h, [row[c] for row in rows]))
-            sheet.freeze_panes(1, 0)
-    except (OSError, xlsxwriter.exceptions.XlsxWriterException) as e:
-        sys.exit(f"Could not write {path}: {e}")
-    print(f"Wrote {len(rows)} sensor{'s' if len(rows) != 1 else ''} to {path}")
+    emit_spreadsheet("xlsx", list_spreadsheet_path(args, ".xlsx"), "Sensors", head, rows, "sensor")
 
 
 def list_xls(args, records):
-    try:
-        import xlwt
-    except ImportError:
-        sys.exit("xlwt not found; install with: pip install xlwt")
-    path = list_spreadsheet_path(args, ".xls")
     head, rows = list_data_rows(records)
-    book = xlwt.Workbook()
-    sheet = book.add_sheet("Sensors")
-    bold = xlwt.easyxf("font: bold on")
-    for c, h in enumerate(head):
-        sheet.write(0, c, h, bold)
-        sheet.col(c).width = 256 * column_width(h, [row[c] for row in rows])
-    for r, row in enumerate(rows, start=1):
-        for c, v in enumerate(row):
-            if v is not None:
-                sheet.write(r, c, v)
-    try:
-        book.save(str(path))
-    except OSError as e:
-        sys.exit(f"Could not write {path}: {e}")
-    print(f"Wrote {len(rows)} sensor{'s' if len(rows) != 1 else ''} to {path}")
+    emit_spreadsheet("xls", list_spreadsheet_path(args, ".xls"), "Sensors", head, rows, "sensor")
 
 
 LIST_OUTPUTS = {"text": list_text, "table": list_table, "csv": list_csv, "xlsx": list_xlsx, "xls": list_xls}
 
 
+INVENTORY_HEADER = ("CATEGORY", "NAME", "DETAILS")
+
+
+def inventory_display_rows(records):
+    """One row per item for the text and table outputs: 'manufacturer=Samsung; size=32 GiB; ...'."""
+    return [(category, name, "; ".join(f"{k}={v}" for k, v in details)) for category, name, details in records]
+
+
+def inventory_data_rows(records):
+    """One row per attribute (category, name, attribute, value) for CSV and spreadsheets, which suit a tidy layout."""
+    return (("category", "name", "attribute", "value"),
+            [(category, name, attribute, value) for category, name, details in records for attribute, value in details])
+
+
+def inventory_spreadsheet_path(args, extension):
+    if args.file:
+        path = Path(args.file)
+        return path if path.suffix else path.with_suffix(extension)
+    parts = [args.host, "inventory"] + [p for p in (args.category, args.name) if p]
+    return Path("_".join(re.sub(r"[^\w.-]", "_", p) for p in parts) + extension)
+
+
+INVENTORY_OUTPUTS = {
+    "text": lambda args, records: emit_text(list(INVENTORY_HEADER), inventory_display_rows(records)),
+    "table": lambda args, records: emit_table(INVENTORY_HEADER, inventory_display_rows(records)),
+    "csv": lambda args, records: emit_csv(*inventory_data_rows(records)),
+    "xlsx": lambda args, records: emit_spreadsheet("xlsx", inventory_spreadsheet_path(args, ".xlsx"), "Inventory",
+                                                   *inventory_data_rows(records), "attribute"),
+    "xls": lambda args, records: emit_spreadsheet("xls", inventory_spreadsheet_path(args, ".xls"), "Inventory",
+                                                  *inventory_data_rows(records), "attribute"),
+}
+
+
+def list_inventory(args):
+    """List the hardware inventory over SNMP in the chosen --output format (--list inventory or --get inventory)."""
+    if args.source not in (None, "snmp"):
+        sys.exit(f"the inventory needs --source snmp: the {args.source} source has none")
+    if args.metric or args.sensor:
+        sys.exit("--metric and --sensor do not apply to the inventory")
+    sub = copy.copy(args)
+    sub.source = "snmp"
+    try:
+        records = asyncio.run(read_inventory(sub, args.category))
+    except SourceError as e:
+        sys.exit(f"Failed to read the inventory of {args.host}: {e}")
+    if args.name:
+        wanted = args.name.lower()
+        matching = [r for r in records if fnmatch.fnmatchcase(r[1].lower(), wanted)]
+        if not matching:
+            names = sorted({r[1] for r in records}, key=_natural)
+            shown = ", ".join(names[:40]) + (f" ... ({len(names)} in all)" if len(names) > 40 else "")
+            sys.exit(f"no {args.category + ' ' if args.category else ''}item is named {args.name!r}; "
+                     f"the names are: {shown}")
+        records = matching
+    INVENTORY_OUTPUTS[args.output](args, records)
+    return 0
+
+
 def list_all(args):
     """List every matching sensor in the chosen --output format (text by default); return an exit code."""
+    if args.list == "inventory":
+        return list_inventory(args)
     sources, metrics = [args.source] if args.source else sorted(SOURCES), [args.metric] if args.metric else None
     if args.list != "all":
         if args.list in SOURCES:
@@ -1186,7 +1404,7 @@ def list_all(args):
         elif args.list in METRIC_NAMES:
             metrics = [args.list]
         else:
-            sys.exit(f"--list: {args.list!r} is not sensors, a source ({', '.join(sorted(SOURCES))}) "
+            sys.exit(f"--list: {args.list!r} is not sensors, inventory, a source ({', '.join(sorted(SOURCES))}) "
                      f"or a metric ({', '.join(METRIC_NAMES)})")
     records, failed = [], 0
     for source in sources:
@@ -1218,7 +1436,9 @@ COUNTER_SAMPLE_SECONDS = 2  # --get on a counter metric waits this long between 
 
 
 def get_value(args):
-    """Poll one snmp sensor now and print its value; return an exit code."""
+    """Poll one snmp sensor now and print its value (or, with --get inventory, the inventory); return an exit code."""
+    if args.get == "inventory":
+        return list_inventory(args)
     args.source = args.source or "snmp"
     if args.source != "snmp":
         sys.exit(f"--get needs --source snmp: the {args.source} source has no live value to read")
@@ -1273,7 +1493,7 @@ def main():
         # credentials are saved for the chosen source; a listing needs a real login, so
         # running one proves the credentials work before they are saved
         saving = copy.copy(args)
-        saving.source = args.source or (args.list if args.list in SOURCES else None) or "web"
+        saving.source = args.source or (args.list if args.list in SOURCES else None) or ("snmp" if "inventory" in (args.list, args.get) else "web")
         saving.metric = args.metric or "temperature"
         try:
             SOURCES[saving.source]["list"](saving)
