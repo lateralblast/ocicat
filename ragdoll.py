@@ -33,7 +33,7 @@ from pathlib import Path
 import requests
 import urllib3
 
-__version__ = "0.3.8"
+__version__ = "0.4.0"
 
 
 class SourceError(Exception):
@@ -581,6 +581,14 @@ def parse_args():
                         "stored. Uses --source snmp by default, with --metric and --sensor choosing the sensor "
                         "(network counters are sampled twice, 2 seconds apart, to give bytes per second). "
                         "--get inventory prints the hardware inventory, the same as --list inventory")
+    p.add_argument("--detail", metavar="DETAIL",
+                   help="with --list inventory or --get inventory: only this detail of each item, for example "
+                        "version for the bios, returned as just its value. Plain text prints the bare values, "
+                        "one per line. Not case-sensitive; a wrong name lists the details the items have")
+    p.add_argument("--field", metavar="FIELD",
+                   help="with --list or --get: print only this field (column) of the output, for example value, "
+                        "unit or key for a sensor, or details for the inventory. Plain text prints just the values, "
+                        "one per line, with no heading. Not case-sensitive; a wrong name lists the fields")
     p.add_argument("--category", choices=[entry[0] for entry in INVENTORY], metavar="CATEGORY",
                    help="with --list inventory or --get inventory: only this category of the inventory ("
                         + ", ".join(entry[0] for entry in INVENTORY) + ")")
@@ -641,8 +649,12 @@ def parse_args():
         p.error("--tz and --utc cannot be used together")
     if args.get not in (None, "sensor", "inventory"):
         p.error(f"--get takes no value or 'inventory', not {args.get!r}; use --metric and --sensor to choose a sensor")
-    if (args.category or args.name) and "inventory" not in (args.list, args.get):
-        p.error("--category and --name only apply to --list inventory or --get inventory")
+    if args.field and not (args.list or args.get):
+        p.error("--field only applies to --list or --get")
+    if (args.category or args.name or args.detail) and "inventory" not in (args.list, args.get):
+        p.error("--category, --name and --detail only apply to --list inventory or --get inventory")
+    if args.detail and args.field:
+        p.error("--detail and --field cannot be used together: --detail already picks what to show")
     if args.list and args.get:
         p.error("--list and --get cannot be used together")
     if args.list or args.get:  # plain text unless another format is asked for
@@ -1225,8 +1237,26 @@ def list_data_rows(records):
     return head, rows
 
 
+def select_field(args, head, rows):
+    """Keep only the column named by --field (not case-sensitive); return (head, rows) unchanged without --field."""
+    if not args.field:
+        return head, rows
+    names = [str(h).lower() for h in head]
+    if args.field.lower() not in names:
+        sys.exit(f"--field {args.field!r} is not a field of this output; the fields are: {', '.join(names)}")
+    i = names.index(args.field.lower())
+    return [head[i]], [[row[i]] for row in rows]
+
+
 def emit_text(head, rows, right=()):
-    """Aligned columns of plain text. The last column is not padded; columns listed in right are right-aligned."""
+    """Aligned columns of plain text. The last column is not padded; columns listed in right are right-aligned.
+
+    A single column (from --field) is printed as bare values, one per line, with no heading, so it can be used in a script.
+    """
+    if len(head) == 1:
+        for row in rows:
+            print(row[0])
+        return
     widths = [max(len(r[i]) for r in [head] + rows) for i in range(len(head) - 1)]
     for row in [head] + rows:
         cells = [c.rjust(w) if i in right else c.ljust(w) for i, (c, w) in enumerate(zip(row, widths))]
@@ -1300,15 +1330,17 @@ def emit_spreadsheet(kind, path, sheet_name, head, rows, noun):
 
 def list_text(args, records):
     """The default: aligned columns of plain text, with VALUE right-aligned."""
-    emit_text(list(LIST_HEADER), list_display_rows(records), right=(4,))
+    head, rows = select_field(args, list(LIST_HEADER), list_display_rows(records))
+    emit_text(head, rows, right=tuple(i for i, h in enumerate(head) if h == "VALUE"))
 
 
 def list_table(args, records):
-    emit_table(LIST_HEADER, list_display_rows(records), right=(4,))
+    head, rows = select_field(args, list(LIST_HEADER), list_display_rows(records))
+    emit_table(head, rows, right=tuple(i for i, h in enumerate(head) if h == "VALUE"))
 
 
 def list_csv(args, records):
-    emit_csv(*list_data_rows(records))
+    emit_csv(*select_field(args, *list_data_rows(records)))
 
 
 def list_spreadsheet_path(args, extension):
@@ -1323,12 +1355,12 @@ def list_spreadsheet_path(args, extension):
 
 
 def list_xlsx(args, records):
-    head, rows = list_data_rows(records)
+    head, rows = select_field(args, *list_data_rows(records))
     emit_spreadsheet("xlsx", list_spreadsheet_path(args, ".xlsx"), "Sensors", head, rows, "sensor")
 
 
 def list_xls(args, records):
-    head, rows = list_data_rows(records)
+    head, rows = select_field(args, *list_data_rows(records))
     emit_spreadsheet("xls", list_spreadsheet_path(args, ".xls"), "Sensors", head, rows, "sensor")
 
 
@@ -1357,15 +1389,49 @@ def inventory_spreadsheet_path(args, extension):
     return Path("_".join(re.sub(r"[^\w.-]", "_", p) for p in parts) + extension)
 
 
-INVENTORY_OUTPUTS = {
-    "text": lambda args, records: emit_text(list(INVENTORY_HEADER), inventory_display_rows(records)),
-    "table": lambda args, records: emit_table(INVENTORY_HEADER, inventory_display_rows(records)),
-    "csv": lambda args, records: emit_csv(*inventory_data_rows(records)),
-    "xlsx": lambda args, records: emit_spreadsheet("xlsx", inventory_spreadsheet_path(args, ".xlsx"), "Inventory",
-                                                   *inventory_data_rows(records), "attribute"),
-    "xls": lambda args, records: emit_spreadsheet("xls", inventory_spreadsheet_path(args, ".xls"), "Inventory",
-                                                  *inventory_data_rows(records), "attribute"),
-}
+def only_detail(args, records):
+    """Keep just the --detail of each item (the items that have it); a name that no item has is rejected."""
+    wanted = args.detail.lower()
+    kept = [(category, name, [(a, v) for a, v in details if a.lower() == wanted])
+            for category, name, details in records]
+    kept = [r for r in kept if r[2]]
+    if not kept:
+        have = sorted({a for _, _, details in records for a, _ in details})
+        sys.exit(f"none of these items has a detail named {args.detail!r}; the details are: {', '.join(have)}")
+    return kept
+
+
+def inventory_text(args, records):
+    if args.detail:  # just the values, one per line, so they can be used in a script
+        for _, _, details in records:
+            print(details[0][1])
+        return
+    emit_text(*select_field(args, list(INVENTORY_HEADER), inventory_display_rows(records)))
+
+
+def inventory_table(args, records):
+    if args.detail:  # category and name, then the detail under its own name
+        emit_table(("CATEGORY", "NAME", records[0][2][0][0].upper()), [(c, n, d[0][1]) for c, n, d in records])
+        return
+    emit_table(*select_field(args, INVENTORY_HEADER, inventory_display_rows(records)))
+
+
+def inventory_csv(args, records):
+    emit_csv(*select_field(args, *inventory_data_rows(records)))
+
+
+def inventory_xlsx(args, records):
+    head, rows = select_field(args, *inventory_data_rows(records))
+    emit_spreadsheet("xlsx", inventory_spreadsheet_path(args, ".xlsx"), "Inventory", head, rows, "attribute")
+
+
+def inventory_xls(args, records):
+    head, rows = select_field(args, *inventory_data_rows(records))
+    emit_spreadsheet("xls", inventory_spreadsheet_path(args, ".xls"), "Inventory", head, rows, "attribute")
+
+
+INVENTORY_OUTPUTS = {"text": inventory_text, "table": inventory_table, "csv": inventory_csv,
+                     "xlsx": inventory_xlsx, "xls": inventory_xls}
 
 
 def list_inventory(args):
@@ -1389,6 +1455,8 @@ def list_inventory(args):
             sys.exit(f"no {args.category + ' ' if args.category else ''}item is named {args.name!r}; "
                      f"the names are: {shown}")
         records = matching
+    if args.detail:
+        records = only_detail(args, records)
     INVENTORY_OUTPUTS[args.output](args, records)
     return 0
 
@@ -1468,7 +1536,10 @@ def get_value(args):
 
 
 def get_text(args, records):
-    """The default for --get: just the value and its unit, for example '16 °C'."""
+    """The default for --get: just the value and its unit, for example '16 °C'; --field picks one part of it."""
+    if args.field:
+        emit_text(*select_field(args, list(LIST_HEADER), list_display_rows(records)))
+        return
     _, _, _, unit, value, _, _ = records[0]
     print(f"{num(value)} {unit}".strip())
 

@@ -231,6 +231,31 @@ memory    DIMM.Socket.A1  size=32 GiB; speed=2133 MHz; manufacturer=Samsung; par
 - A spreadsheet is named after the filters: `<host>_inventory_memory.xlsx`,
   `<host>_inventory_memory_DIMM.Socket.A1.xlsx` (a `*` in the name becomes `_`).
 
+**Getting a single detail.** Each item's details are `attribute=value` pairs. `--detail` returns just the value of one
+attribute, for example the BIOS version:
+
+```
+$ python3 ragdoll.py --host 192.0.2.20 --get inventory --name bios --detail version
+2.19.0
+$ python3 ragdoll.py --host 192.0.2.20 --get inventory --category virtual-disk --detail layout
+RAID 1
+RAID 5
+$ python3 ragdoll.py --host 192.0.2.20 --get inventory --category disk --detail firmware | sort | uniq -c
+      9 8EET6101
+      1 8EET6103
+```
+
+- The attribute name is not case-sensitive. The attributes of each category are the names shown in the details, for
+  example `version`, `released`, `manufacturer` and `status` for the BIOS, or `size`, `speed`, `part-number`, `serial`
+  and `status` for memory.
+- In plain text the values are bare, one per line with no heading, so they can go into a script:
+  `bios=$(python3 ragdoll.py --host 192.0.2.20 --get inventory --name bios --detail version)`. With several items the
+  names are not printed; add `--output table` to see them (`CATEGORY`, `NAME` and the detail as its own column), or
+  `--output csv`, `xlsx` or `xls`, which give the usual `category,name,attribute,value` rows for just that attribute.
+- Items that do not have the detail are left out (`--detail size` skips the CPUs, for instance). If no item has it,
+  the error lists the details the items do have.
+- `--detail` cannot be combined with `--field`, which picks a column of the output instead.
+
 `--output` works as for sensors, with one difference: `text` and `table` show one row per item, with its details
 joined as `attribute=value`, while `csv`, `xlsx` and `xls` are tidy, one row per attribute (`category`, `name`,
 `attribute`, `value`), which suits filtering and pivot tables. A spreadsheet is named `<host>_inventory.xlsx` (or
@@ -255,9 +280,9 @@ $ python3 ragdoll.py --host 192.0.2.20 --metric health --sensor system --get
 
 - **Nothing is stored.** `--get` does not touch the cache or a database, even with `--db`. To record readings, poll
   the sensor normally.
-- **In a script:** the output is the number, a space and the unit, so `awk '{print $1}'` gives the bare number:
-  `temp=$(python3 ragdoll.py --host 192.0.2.20 --get | awk '{print $1}')`. A failure prints a message on stderr and
-  exits with status 1.
+- **In a script:** `--field value` prints just the number (see [Picking one field](#picking-one-field)):
+  `temp=$(python3 ragdoll.py --host 192.0.2.20 --get --field value)`. Without it the output is the number, a space and
+  the unit. A failure prints a message on stderr and exits with status 1.
 - **Counters:** a network counter has no value of its own, so `--metric network --get` reads it twice, 2 seconds apart,
   and prints the rate in bytes per second (`2184.523 B/s`).
 - **Other formats:** `--output table|csv|xlsx|xls` shows the same one sensor as a row, with its unit, limits and key, as
@@ -266,6 +291,35 @@ $ python3 ragdoll.py --host 192.0.2.20 --metric health --sensor system --get
   rejected. `--get` cannot be combined with `--list` or `--no-fetch`.
 - **Inventory:** `--get inventory` prints the [hardware inventory](#hardware-inventory), the same as
   `--list inventory`. It takes no `--metric` or `--sensor`, and any other word after `--get` is rejected.
+
+## Picking one field
+
+`--field` returns just one field (column) of what `--list` or `--get` would print. It is not case-sensitive.
+
+```
+$ python3 ragdoll.py --host 192.0.2.20 --get inventory --category system --field details
+model=PowerEdge R630; name=r630xp1; service-tag=XXXXXXX
+$ python3 ragdoll.py --host 192.0.2.20 --get --field value
+16
+$ python3 ragdoll.py --host 192.0.2.20 --list fan --field sensor
+fan1a
+fan1b
+fan2a
+...
+```
+
+- In plain text, a single field is printed as bare values, one per line, with no heading, so it can go straight into a
+  script or a pipe. In `table`, `csv`, `xlsx` and `xls` the one column keeps its heading.
+- The fields are the columns of the chosen `--output`, so they differ a little between formats. A wrong name is
+  rejected with the fields that exist.
+
+| | `text` and `table` | `csv`, `xlsx` and `xls` |
+|---|---|---|
+| Sensors (`--list`, `--get`) | `source`, `metric`, `sensor`, `unit`, `value`, `limits`, `key` | `source`, `metric`, `sensor`, `unit`, `value`, `lower_critical`, `lower_warning`, `upper_warning`, `upper_critical`, `key` |
+| Inventory | `category`, `name`, `details` | `category`, `name`, `attribute`, `value` |
+
+For example `--get --field unit` gives `°C`, `--get --field limits` gives `warn 3..42 crit -7..47`, and
+`--get --field key` gives the sensor's OID. `--field` only applies with `--list` or `--get`.
 
 ## Charts
 
@@ -501,6 +555,8 @@ horizontal`; for just the current value, use [`--get`](#getting-a-current-value)
 | `--list [sensors\|inventory\|SOURCE\|METRIC]` | list the sensors, or the hardware inventory, and exit |
 | `--get [inventory]` | print one sensor's current value over SNMP, or with `inventory` the hardware inventory, and exit |
 | `--category C`, `--name N` | with `--list inventory` or `--get inventory`: only that category, or only the items with that name (wildcards allowed) |
+| `--detail D` | with `--list inventory` or `--get inventory`: only the value of that attribute of each item |
+| `--field F` | with `--list` or `--get`: print only that field (column) of the output |
 | `--user`/`--username`, `--pass`/`--password` | web credentials |
 | `--community` | SNMP v2c community string |
 | `--save-credentials`, `--forget-credentials` | keep or remove this host's credentials in the OS keyring |
@@ -669,7 +725,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
 
 ## Version
 
-Current version: **0.3.8**. Print it with `python3 ragdoll.py --version`.
+Current version: **0.4.0**. Print it with `python3 ragdoll.py --version`.
 
 Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.

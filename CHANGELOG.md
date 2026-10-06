@@ -8,10 +8,34 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.3.8 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.4.0 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+## [0.4.0] - 2026-10-06
+
+### Added
+- `--detail DETAIL` returns just one attribute of each inventory item, as its value only: for example
+  `--get inventory --name bios --detail version` prints `2.19.0`. The attribute name is not case-sensitive.
+- In plain text the values are bare, one per line; `--output table` shows `CATEGORY`, `NAME` and the detail under its
+  own name; `csv`, `xlsx` and `xls` give the `category,name,attribute,value` rows for just that attribute.
+- Items without the detail are skipped. If none has it, the error lists the details the items do have.
+- `--detail` is rejected without `--list inventory` or `--get inventory`, and together with `--field`.
+
+## [0.3.9] - 2026-10-06
+
+### Added
+- `--field FIELD` returns just one field of what `--list` or `--get` prints, for example
+  `--get inventory --category system --field details`, `--get --field value` (a bare `16`) or
+  `--list fan --field sensor`. It is not case-sensitive.
+- The fields are the columns of the chosen `--output`: for sensors `source`, `metric`, `sensor`, `unit`, `value`,
+  `limits`, `key` in `text` and `table`, and the four limit columns in place of `limits` in `csv`, `xlsx` and `xls`;
+  for the inventory `category`, `name`, `details` in `text` and `table`, and `category`, `name`, `attribute`,
+  `value` in `csv`, `xlsx` and `xls`. A wrong name is rejected with the fields that exist.
+- In plain text one field is printed as bare values, one per line with no heading, which suits scripts; the other
+  formats keep the heading.
+- `--field` is rejected without `--list` or `--get`.
 
 ## [0.3.8] - 2026-10-06
 
