@@ -9,6 +9,7 @@ License: Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
 
 import argparse
 import asyncio
+import atexit
 import calendar
 import collections
 import concurrent.futures
@@ -24,6 +25,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -35,7 +37,7 @@ from pathlib import Path
 import requests
 import urllib3
 
-__version__ = "0.4.2"
+__version__ = "0.4.5"
 
 
 class SourceError(Exception):
@@ -402,6 +404,8 @@ def keyring_forget(host):
 
 def resolve_credentials(args):
     """Fill in missing credentials, in place. Order: command line, environment, keyring, prompt."""
+    if SOURCES.get(args.source, {}).get("local"):
+        return  # this computer's own sensors need no login
     fields = ("community",) if args.source == "snmp" else ("user", "password")
     for field in fields:
         if getattr(args, field):
@@ -559,7 +563,8 @@ def parse_args():
     p = argparse.ArgumentParser(description=". ".join(q.replace("\n", " ") for q in paragraphs[:2]),
                                 epilog=paragraphs[2].replace("\n", " "))
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    p.add_argument("--host", required=True, help="iDRAC address, e.g. 192.168.8.98")
+    p.add_argument("--host", help="iDRAC address, e.g. 192.168.8.98. With --source lmsensors it is optional: without it this "
+                                  "computer is read, with it ragdoll runs sensors on that computer over ssh")
     p.add_argument("--user", "--username", dest="user", help="iDRAC username (web source; else $IDRAC_USER or the keyring)")
     p.add_argument("--pass", "--password", dest="password",
                    help="iDRAC password (web source; else $IDRAC_PASS, the keyring, or a prompt)")
@@ -571,7 +576,8 @@ def parse_args():
                    help="delete this host's credentials from the OS keyring and exit")
     p.add_argument("--source", choices=sorted(SOURCES), type=lambda v: SOURCE_ALIASES.get(v.lower(), v.lower()),
                    help="where sensor data comes from: web is the iDRAC web interface (history), "
-                        "snmp reads the current value and builds history in the cache, and redfish provides only the inventory "
+                        "snmp reads the current value and builds history in the cache, lmsensors does the same for this "
+                        "computer's own sensors (lm-sensors), and redfish provides only the inventory "
                         "(gui is an alias for web; default: web; "
                         "with --list, all sources)")
     p.add_argument("--metric", choices=METRIC_NAMES,
@@ -657,7 +663,20 @@ def parse_args():
     p.add_argument("--last", type=parse_last, default="10",
                    help="how much to graph: a row count (10) or a period such as "
                         "hour, day, week, month, year, 6h, 2days (default: 10 rows)")
+    p.set_defaults(remote=False)  # True when a local source is run on another computer over ssh
     args = p.parse_args()
+    local = SOURCES.get(args.source, {}).get("local") or SOURCES.get(args.list, {}).get("local")
+    if local:  # without --host, this computer, named by its own hostname; with one, that computer over ssh
+        if args.host:
+            args.remote = True
+            if args.host.startswith("-") or (args.user and (args.user.startswith("-") or re.search(r"\s", args.user))):
+                p.error("--host and --user must not start with '-' or contain spaces")
+            if args.password:
+                p.error("ssh logs in with a key or the ssh agent, so --pass does not apply to --source lmsensors")
+        else:
+            args.host = socket.gethostname()
+    elif not args.host:
+        p.error("the following arguments are required: --host")
     if args.tz and args.utc:
         p.error("--tz and --utc cannot be used together")
     if args.get not in (None, "sensor", "inventory"):
@@ -942,9 +961,184 @@ def load_limits(args):
         return None
 
 
-def snmp_fetch(args):
-    """Take one reading and append it to the cached history (SNMP has no history of its own)."""
-    table = asyncio.run(snmp_read_table(args))
+# --- lmsensors: the sensors of the computer ragdoll runs on, read with `sensors -j` (from the lm-sensors package) ---
+LM_TYPES = {"temp": "temperature", "fan": "fan", "in": "voltage", "power": "power", "curr": "power"}
+# lm-sensors limits and the limit each one becomes
+LM_LIMITS = {"crit": "upper_critical", "max": "upper_warning", "min": "lower_warning", "lcrit": "lower_critical"}
+
+
+def lm_slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+# --- ssh, for lmsensors on another computer ---
+# paramiko is used so that one connection can serve every poll. It checks host keys strictly (against ~/.ssh/known_hosts,
+# and a host that is not there is refused, never accepted automatically), logs in with the ssh agent and key files and
+# never a password, and reads HostName, User, Port, IdentityFile and ProxyCommand from ~/.ssh/config. The ssh command is
+# used instead when paramiko is not installed or the config for the host uses ProxyJump, which paramiko does not apply.
+_SSH_CLIENTS = {}  # (host, user) -> connected paramiko client, kept for the life of the process
+
+
+def close_ssh_clients():
+    for client in _SSH_CLIENTS.values():
+        try:
+            client.close()
+        except Exception:
+            pass
+    _SSH_CLIENTS.clear()
+
+
+atexit.register(close_ssh_clients)
+
+
+def ssh_config_for(host):
+    """What ~/.ssh/config says about host (a dict with lower-case keys), or {} if there is no config."""
+    import paramiko
+    path = Path.home() / ".ssh" / "config"
+    return dict(paramiko.SSHConfig.from_path(str(path)).lookup(host)) if path.exists() else {}
+
+
+def lm_ssh_command(args):
+    """The ssh command that prints `sensors -j` on args.host (the fallback; batch mode, so it never asks for a password)."""
+    target = f"{args.user}@{args.host}" if args.user else args.host
+    # `--` keeps a host from being read as an ssh option
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", "--", target, "sensors -j"]
+
+
+def ssh_connect(args):
+    """Return a connected paramiko client for args.host, reusing one from an earlier poll if it is still alive."""
+    import paramiko
+    cfg = ssh_config_for(args.host)
+    user = args.user or cfg.get("user") or getpass.getuser()
+    key = (args.host, user)
+    client = _SSH_CLIENTS.get(key)
+    if client and client.get_transport() and client.get_transport().is_active():
+        return client
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()  # ~/.ssh/known_hosts
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())  # a host key that is not known is refused
+    try:
+        client.connect(
+            hostname=cfg.get("hostname", args.host), port=int(cfg.get("port", 22)), username=user,
+            key_filename=[os.path.expanduser(f) for f in cfg.get("identityfile", [])] or None,
+            sock=paramiko.ProxyCommand(cfg["proxycommand"]) if cfg.get("proxycommand") else None,
+            allow_agent=True, look_for_keys=True, timeout=10, banner_timeout=10, auth_timeout=10)
+    except paramiko.BadHostKeyException:
+        raise SourceError(f"the ssh host key of {args.host} is different from the one in ~/.ssh/known_hosts: "
+                          f"it may have been reinstalled, or this may be an attack; check it, then `ssh-keygen -R {args.host}`")
+    except paramiko.AuthenticationException:
+        raise SourceError(f"ssh login to {user}@{args.host} failed: no key or agent identity was accepted (ssh logs in with "
+                          f"a key or the ssh agent, never a password: check that `ssh {user}@{args.host}` works without a prompt)")
+    except paramiko.SSHException as e:
+        if "not found in known_hosts" in str(e):
+            raise SourceError(f"the ssh host key of {args.host} is not in ~/.ssh/known_hosts, and ragdoll will not accept it "
+                              f"on its own: run `ssh {user}@{args.host}` once and check the key it shows")
+        raise SourceError(f"ssh to {args.host} failed: {e}")
+    except (OSError, EOFError) as e:  # no route, refused, timed out, name not found
+        raise SourceError(f"could not connect to {args.host} over ssh: {e}")
+    _SSH_CLIENTS[key] = client
+    return client
+
+
+def lm_run_remote(args):
+    """Run `sensors -j` on args.host: returns (exit status, stdout, stderr)."""
+    try:
+        import paramiko
+        use_paramiko = "proxyjump" not in ssh_config_for(args.host)
+    except ImportError:
+        use_paramiko = False
+    if not use_paramiko:  # paramiko is missing, or ~/.ssh/config needs ProxyJump: use the ssh command
+        try:
+            run = subprocess.run(lm_ssh_command(args), capture_output=True, text=True, timeout=60)
+        except FileNotFoundError:
+            raise SourceError("neither the paramiko module nor the ssh command is available; pip install paramiko")
+        except subprocess.TimeoutExpired:
+            raise SourceError(f"sensors -j took too long on {args.host}")
+        if run.returncode == 255:  # ssh's own failure
+            raise SourceError(f"could not ssh to {args.host}: {run.stderr.strip() or 'connection failed'} (ssh logs in with "
+                              "a key or the ssh agent, never a password)")
+        return run.returncode, run.stdout, run.stderr
+    for attempt in (1, 2):  # a connection kept from an earlier poll may have dropped: reconnect once
+        client = ssh_connect(args)
+        try:
+            _, out, err = client.exec_command("sensors -j", timeout=30)
+            text, errors = out.read().decode(errors="replace"), err.read().decode(errors="replace")
+            return out.channel.recv_exit_status(), text, errors
+        except (paramiko.SSHException, EOFError, OSError) as e:
+            for known, other in list(_SSH_CLIENTS.items()):  # forget the dead connection
+                if other is client:
+                    del _SSH_CLIENTS[known]
+            client.close()
+            if attempt == 2:
+                raise SourceError(f"sensors -j failed over ssh on {args.host}: {e}")
+
+
+def lm_read(args):
+    """Return {sensor: Reading} for args.metric from `sensors -j`. A sensor is named <chip>-<label>."""
+    where = f"on {args.host}" if args.remote else "on this computer"
+    if args.remote:
+        status, stdout, stderr = lm_run_remote(args)
+    else:
+        try:
+            run = subprocess.run(["sensors", "-j"], capture_output=True, text=True, timeout=30)
+        except FileNotFoundError:
+            raise SourceError("the sensors command was not found; install lm-sensors (for example: sudo apt install lm-sensors)")
+        except subprocess.TimeoutExpired:
+            raise SourceError("sensors -j took too long")
+        status, stdout, stderr = run.returncode, run.stdout, run.stderr
+    if status == 127:
+        raise SourceError(f"the sensors command was not found {where}; install lm-sensors there")
+    if status != 0:
+        raise SourceError(f"sensors -j failed {where}: {stderr.strip() or status}")
+    try:
+        chips = json.loads(stdout)
+    except ValueError:
+        raise SourceError(f"sensors -j {where} did not return JSON (this lm-sensors may be too old; it needs version 3.5 or newer)")
+    found = {}
+    for chip, features in chips.items():
+        for label, subfeatures in features.items():
+            if not isinstance(subfeatures, dict):
+                continue  # the "Adapter" entry is a string
+            for key, value in subfeatures.items():
+                kind = re.fullmatch(r"([a-z]+)\d+_(input|average)", key)
+                if not kind or LM_TYPES.get(kind.group(1)) != args.metric:
+                    continue
+                prefix = key.rsplit("_", 1)[0]
+                name = lm_slug(f"{chip}-{label}") + ("-current" if kind.group(1) == "curr" else "")
+                limits = {LM_LIMITS[s]: float(subfeatures[f"{prefix}_{s}"]) for s in LM_LIMITS if f"{prefix}_{s}" in subfeatures}
+                found[name] = Reading(f"{chip}/{label}", float(value), limits or None)
+    return found
+
+
+def lm_list(args):
+    return lm_read(args)
+
+
+def default_sensor(args, metric):
+    """The sensor to use when --sensor is not given: the metric's default, or for lmsensors a sensible local one."""
+    if args.source != "lmsensors":
+        return metric["default"]
+    names = sorted(lm_read(args))
+    if not names:
+        raise SourceError(f"lm-sensors {'on ' + args.host if args.remote else 'on this computer'} has no {args.metric} sensors")
+    for hint in ("package-id-0", "tctl", "composite", "cpu"):  # the CPU or the main drive, if there is one
+        for name in names:
+            if hint in name:
+                return name
+    return names[0]
+
+
+def read_current(args):
+    """Read every sensor of args.metric right now from a source that reports current values: {sensor: Reading}."""
+    if args.source == "snmp":
+        return asyncio.run(snmp_read_table(args))
+    if args.source == "lmsensors":
+        return lm_read(args)
+    raise SourceError(f"the {args.source} source has no live value to read")
+
+
+def record_current(args, table):
+    """Append the current reading of args.sensor to the cached history; return the CSV (these sources keep none)."""
     if args.sensor not in table:
         raise SourceError(f"unknown sensor {args.sensor!r}; available: {', '.join(sorted(table))}")
     reading = table[args.sensor]
@@ -956,6 +1150,16 @@ def snmp_fetch(args):
     return history + f"{num(reading.value)},{num(reading.value)},{epoch_to_csv(int(time.time()))}\n"
 
 
+def lm_fetch(args):
+    """Take one reading from this computer's sensors and append it to the cached history."""
+    return record_current(args, lm_read(args))
+
+
+def snmp_fetch(args):
+    """Take one reading and append it to the cached history (SNMP has no history of its own)."""
+    return record_current(args, asyncio.run(snmp_read_table(args)))
+
+
 # Each source provides list(args) -> {sensor: Reading} and fetch(args) -> CSV text
 # ("Average,Peak,Time" rows). accumulate=True means fetch() returns only a current reading
 # appended to the cached history. Others (redfish, ipmi, ...) can be added here.
@@ -963,6 +1167,9 @@ SOURCE_ALIASES = {"gui": "web"}  # alternative names accepted for --source and -
 SOURCES = {
     "web": {"list": web_list, "fetch": web_fetch, "accumulate": False, "metrics": ("temperature",)},
     "snmp": {"list": snmp_list, "fetch": snmp_fetch, "accumulate": True, "metrics": METRIC_NAMES},
+    # the sensors of this computer: no host, no credentials, and only listed when asked for by name
+    "lmsensors": {"list": lm_list, "fetch": lm_fetch, "accumulate": True, "local": True,
+                  "metrics": ("temperature", "fan", "power", "voltage")},
     # Redfish provides the inventory only (see read_inventory_redfish), so it has no metrics
     "redfish": {"list": lambda args: redfish_list(args), "fetch": lambda args: redfish_fetch(args),
                 "accumulate": False, "metrics": ()},
@@ -1642,6 +1849,8 @@ def list_inventory(args):
     sub = copy.copy(args)
     # snmp is the default; redfish (and web, the iDRAC's web interface, which is where Redfish lives) use Redfish
     sub.source = args.source or "snmp"
+    if sub.source not in ("snmp", "redfish", "web"):
+        sys.exit(f"the inventory needs --source snmp or redfish, not {sub.source}")
     try:
         if sub.source == "snmp":
             records = asyncio.run(read_inventory(sub, args.category))
@@ -1673,7 +1882,8 @@ def list_all(args):
     """List every matching sensor in the chosen --output format (text by default); return an exit code."""
     if args.list == "inventory":
         return list_inventory(args)
-    sources, metrics = [args.source] if args.source else sorted(SOURCES), [args.metric] if args.metric else None
+    everywhere = [s for s in sorted(SOURCES) if not SOURCES[s].get("local")]  # a local source is listed only by name
+    sources, metrics = [args.source] if args.source else everywhere, [args.metric] if args.metric else None
     if args.list != "all":
         if args.list in SOURCES:
             sources = [args.list]
@@ -1718,8 +1928,8 @@ def poll_once(args, state):
     snmp gives one reading, stamped now. web gives its whole hourly history: all of it is stored (rows already in the
     database are skipped), and the rows newer than the last one shown are displayed (the newest, the first time).
     """
-    if args.source == "snmp":
-        table = asyncio.run(snmp_read_table(args))
+    if args.source in ("snmp", "lmsensors"):
+        table = read_current(args)
         if args.sensor not in table:
             raise SourceError(f"unknown sensor {args.sensor!r}; available: {', '.join(sorted(table))}")
         reading = table[args.sensor]
@@ -1760,8 +1970,8 @@ def tail_emit(args, metric, rows, state):
 
 def tail(args, metric):
     """Poll the source every --poll seconds until Ctrl-C (or SIGTERM), sending each reading to --output."""
-    if args.source not in ("snmp", "web"):
-        sys.exit(f"--tail needs --source snmp or web, not {args.source}")
+    if args.source not in ("snmp", "web", "lmsensors"):
+        sys.exit(f"--tail needs --source snmp, web or lmsensors, not {args.source}")
     store = bool(args.db)  # --db stores as well as shows; --output db stores only (parse_args gave it a path)
     state = {"polls": 0, "stored": 0, "failed": 0}
     interactive = sys.stderr.isatty()
@@ -1823,13 +2033,16 @@ def get_value(args):
     if args.get == "inventory":
         return list_inventory(args)
     args.source = args.source or "snmp"
-    if args.source != "snmp":
-        sys.exit(f"--get needs --source snmp: the {args.source} source has no live value to read")
+    if args.source not in ("snmp", "lmsensors"):
+        sys.exit(f"--get needs --source snmp or lmsensors: the {args.source} source has no live value to read")
     args.metric = args.metric or "temperature"
+    if args.metric not in SOURCES[args.source]["metrics"]:
+        sys.exit(f"--source {args.source} does not support --metric {args.metric}; "
+                 f"it supports: {', '.join(SOURCES[args.source]['metrics'])}")
     metric = METRICS[args.metric]
-    args.sensor = args.sensor or metric["default"]
     try:
-        table = asyncio.run(snmp_read_table(args))
+        args.sensor = args.sensor or default_sensor(args, metric)
+        table = read_current(args)
         if args.sensor not in table:
             raise SourceError(f"unknown sensor {args.sensor!r}; available: {', '.join(sorted(table))}")
         reading = table[args.sensor]
@@ -1837,13 +2050,13 @@ def get_value(args):
         if metric.get("counter"):  # a counter has no value of its own: measure the rate over a short interval
             started = time.monotonic()
             time.sleep(COUNTER_SAMPLE_SECONDS)
-            after = asyncio.run(snmp_read_table(args))[args.sensor].value
+            after = read_current(args)[args.sensor].value
             elapsed = time.monotonic() - started
             value = round((after - value) / elapsed, 3) if after >= value else None  # a lower counter means a restart
             if value is None:
                 raise SourceError("the counter went down while measuring (the iDRAC restarted?); try again")
     except SourceError as e:
-        sys.exit(f"Failed to read {args.sensor} from {args.host}: {e}")
+        sys.exit(f"Failed to read {args.sensor or 'the sensors'} from {args.host}: {e}")
     record = (args.source, args.metric, args.sensor, metric["unit"](args.sensor).strip(), value, reading.limits,
               reading.key)
     GET_OUTPUTS[args.output](args, [record])
@@ -1899,7 +2112,10 @@ def main():
         sys.exit(f"--source {args.source} does not support --metric {args.metric}; "
                  f"it supports: {', '.join(SOURCES[args.source]['metrics'])}")
     metric = METRICS[args.metric]
-    args.sensor = args.sensor or metric["default"]
+    try:
+        args.sensor = args.sensor or default_sensor(args, metric)
+    except SourceError as e:
+        sys.exit(f"Failed to read the sensors: {e}")
     if args.tail:
         sys.exit(tail(args, metric))
     if args.no_fetch:

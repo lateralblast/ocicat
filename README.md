@@ -6,7 +6,8 @@ Redfish/API/GUI/DRAC/Other Log Linter - Converts iDRAC Telemetry and other infor
 
 ragdoll reads telemetry from a Dell iDRAC and turns it into something you can use: a chart in the terminal, a table,
 CSV, or an Excel spreadsheet. It currently reads temperatures, fan speeds, power, voltage, component health and
-management-network traffic, through the iDRAC's web interface or over SNMP.
+management-network traffic, through the iDRAC's web interface, SNMP or Redfish. It can also read the computer it
+is running on, through lm-sensors.
 
 - [Install](#install) and [quick start](#quick-start)
 - [Sources and metrics](#sources-and-metrics): what can be read, and the SNMP-only extras
@@ -14,7 +15,7 @@ management-network traffic, through the iDRAC's web interface or over SNMP.
 - [Charts](#charts) and [other outputs](#other-outputs): table, CSV, spreadsheets
 - [Time zones](#time-zones)
 - [Storage](#storage): cache, SQLite database, offline use
-- [Credentials](#credentials), [running regularly](#running-regularly) and [polling](#polling-with---tail)
+- [This computer's sensors](#this-computers-sensors-lm-sensors), [credentials](#credentials), [running regularly](#running-regularly) and [polling](#polling-with---tail)
 - [Option reference](#option-reference), [example output](#example-output) and [notes](#notes)
 
 ## Install
@@ -23,9 +24,12 @@ management-network traffic, through the iDRAC's web interface or over SNMP.
 pip install -r requirements.txt
 ```
 
-This installs `requests` (web source), `pysnmp` (snmp source), `keyring` (saved credentials), `terminaltables` (table
+This installs `requests` (web source), `pysnmp` (snmp source), `paramiko` (ssh, for `--source lmsensors --host`), `keyring` (saved credentials), `terminaltables` (table
 output), `XlsxWriter` and `xlwt` (`.xlsx` and `.xls` output), and the two graphing modules, `plotext` and `termgraph`.
 `plotext` is pinned to 5.3.2 because 6.x has a different API.
+
+The `lmsensors` source also needs the `lm-sensors` package, which is a system package and not a Python one (for example
+`sudo apt install lm-sensors`, then `sudo sensors-detect` once to find the hardware). Nothing else needs it.
 
 ragdoll is a single script, `ragdoll.py`. It was written and tested with Python 3.14 and uses the standard `zoneinfo`
 module, so it needs at least Python 3.9; older versions have not been tried.
@@ -47,11 +51,12 @@ Credentials do not have to be typed each time: see [Credentials](#credentials).
 
 ## Sources and metrics
 
-ragdoll reads from three sources, chosen with `--source` (`gui` is accepted as another name for `web`):
+ragdoll reads from four sources, chosen with `--source` (`gui` is accepted as another name for `web`):
 
 | Source | Metrics | How it works | History |
 |---|---|---|---|
 | `web` (default; also `gui`) | temperature | Logs in to the iDRAC web interface and downloads the temperature statistics CSV | Hourly history held by the iDRAC |
+| `lmsensors` | temperature, fan, power, voltage | Reads the sensors of the computer ragdoll runs on, through `sensors -j` from lm-sensors. No `--host` or login needed | Only the current value; each run appends a reading to the local cache, as with snmp |
 | `redfish` | none: the [hardware inventory](#hardware-inventory) only | Reads the inventory from the iDRAC's Redfish API over HTTPS | The inventory is a snapshot, so there is no history |
 | `snmp` | temperature, fan, power, voltage, health, network | Reads the current value from the Dell probe tables (and the standard interface counters) over SNMP v2c | Only the current value; each run appends a reading to the local cache, so history builds up over time |
 
@@ -523,6 +528,71 @@ python3 ragdoll.py --host 192.0.2.10 --no-fetch --chart line --last month
   iDRAC. Sensor names cannot be checked against the iDRAC in this mode, so a misspelt sensor is reported as having no
   stored readings.
 
+## This computer's sensors (lm-sensors)
+
+`--source lmsensors` reads the sensors of a computer with `sensors -j` from lm-sensors, so a desktop, server or
+laptop can be charted and logged the same way as an iDRAC. Without `--host` it reads the computer ragdoll is running
+on, which needs no login and no network, and the computer's own hostname names it in the cache and the database. With
+`--host` it logs in to that computer over ssh and runs `sensors -j` there (see below).
+
+```
+$ python3 ragdoll.py --source lmsensors --list
+SOURCE     METRIC       SENSOR                          UNIT  VALUE  LIMITS                           KEY
+lmsensors  temperature  acpitz-acpi-0-temp1             °C     27.8  -                                acpitz-acpi-0/temp1
+lmsensors  temperature  coretemp-isa-0000-core-0        °C       59  warn -..86 crit -..100           coretemp-isa-0000/Core 0
+lmsensors  temperature  coretemp-isa-0000-package-id-0  °C       64  warn -..86 crit -..100           coretemp-isa-0000/Package id 0
+lmsensors  temperature  nvme-pci-0100-composite         °C    39.85  warn -0.15..81.85 crit -..85.85  nvme-pci-0100/Composite
+```
+
+- **Sensors:** each is named `<chip>-<label>`, in lower case with dashes, for example
+  `coretemp-isa-0000-package-id-0` (the CPU package) or `nvme-pci-0100-composite` (an NVMe drive). `--list` shows what
+  this computer has; it varies, and a machine without a fan or voltage sensor lists none.
+- **Metrics:** `temperature` (°C), `fan` (RPM), `voltage` (V) and `power` (W; a current is named `...-current` and shown
+  in A). `--metric` chooses, and the default is temperature. `health` and `network` are not available.
+- **Default sensor:** with no `--sensor`, ragdoll picks the CPU package, `tctl`, a drive's `composite`, or a `cpu`
+  sensor if there is one, and otherwise the first alphabetically.
+- **Limits:** lm-sensors' `crit`, `max`, `min` and `lcrit` become the upper critical, upper warning, lower warning and
+  lower critical limits, so `--list` shows them and `--limits` draws them.
+- **Everything else works as for SNMP:** `--get`, `--tail`, `--output`, `--db` and the other options, and each run
+  appends a reading to the cache, so history builds up (use `--tail` or cron). It is not included in a plain `--list`
+  of a host's sensors: ask for it by name, `--list lmsensors`.
+
+```
+$ python3 ragdoll.py --source lmsensors --get
+65 °C
+$ python3 ragdoll.py --source lmsensors --get --sensor nvme-pci-0100-composite --field limits
+warn -0.15..81.85 crit -..85.85
+$ python3 ragdoll.py --source lmsensors --tail --poll 60 --output db      # log it every minute
+```
+
+### Another computer, over ssh
+
+Give `--host` (and `--user`, if the login name is not yours) and ragdoll runs `sensors -j` on that computer over ssh.
+The readings, the cache and the database are then named after that host.
+
+```
+python3 ragdoll.py --source lmsensors --host 192.0.2.30 --user <user> --list
+python3 ragdoll.py --source lmsensors --host 192.0.2.30 --user <user> --get
+python3 ragdoll.py --source lmsensors --host 192.0.2.30 --user <user> --tail --poll 60 --output db
+```
+
+- **How it connects:** ragdoll uses the `paramiko` ssh module and keeps one connection open for the whole run, so a
+  `--tail` or a listing of every metric does not log in again for each read (about a second per poll with the `ssh`
+  command, a fraction of that now).
+- **Login:** your keys and the ssh agent are used, and never a password. `--pass` is rejected, and if no key is accepted
+  you get a message saying so with a hint to check `ssh <user>@<host>` by hand.
+- **Host keys are checked strictly** against `~/.ssh/known_hosts`. A host that is not there is refused, not accepted
+  automatically: ssh to it once yourself and check the key. A key that has changed is refused with a warning. ragdoll
+  never writes to `known_hosts`.
+- **`~/.ssh/config` is read** for the host's `HostName`, `User`, `Port`, `IdentityFile` and `ProxyCommand`, so an alias
+  such as `--host labbox` works. `--user` overrides the `User` in the config.
+- **The `ssh` command is the fallback** when paramiko is not installed or the config for the host uses `ProxyJump`,
+  which paramiko does not apply. It is run as `ssh -o BatchMode=yes -o ConnectTimeout=10 -o LogLevel=ERROR -- <user>@<host>
+  'sensors -j'`, with `--` so that a host name cannot be taken as an ssh option; a `--host` or `--user` that starts with
+  `-` or contains a space is rejected either way.
+- **On the other computer:** it needs `lm-sensors` installed (otherwise the error says so) and the login needs
+  permission to run `sensors`. Nothing is installed or changed there.
+
 ## Credentials
 
 No credential is stored in the script. The web source takes `--user` and `--pass` (also spelt `--username` and
@@ -631,8 +701,8 @@ A systemd service or a terminal multiplexer is a good place to run it. For one r
 
 | Option | What it does |
 |---|---|
-| `--host HOST` | the iDRAC's address (required) |
-| `--source web\|snmp\|redfish` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get` and for the inventory. `redfish` (and `web`) read the inventory over Redfish |
+| `--host HOST` | the iDRAC's address (required, except with `--source lmsensors`: without it this computer is read, with it that computer over ssh) |
+| `--source web\|snmp\|redfish\|lmsensors` | where the data comes from (`gui` = `web`); default `web`, or `snmp` with `--get`, `--tail` and for the inventory. `redfish` (and `web`) read the inventory over Redfish; `lmsensors` reads this computer |
 | `--metric M` | `temperature`, `fan`, `power`, `voltage`, `health` or `network`; default `temperature` |
 | `--sensor S` | which sensor of the metric; the default depends on the metric |
 | `--list [sensors\|inventory\|SOURCE\|METRIC]` | list the sensors, or the hardware inventory, and exit |
@@ -640,7 +710,7 @@ A systemd service or a terminal multiplexer is a good place to run it. For one r
 | `--category C`, `--name N` | with `--list inventory` or `--get inventory`: only that category, or only the items with that name (wildcards allowed) |
 | `--detail D` | with `--list inventory` or `--get inventory`: only the value of that attribute of each item |
 | `--field F` | with `--list` or `--get`: print only that field (column) of the output |
-| `--user`/`--username`, `--pass`/`--password` | web credentials |
+| `--user`/`--username`, `--pass`/`--password` | web credentials; with `--source lmsensors --host`, `--user` is the ssh login name and `--pass` is not allowed |
 | `--community` | SNMP v2c community string |
 | `--save-credentials`, `--forget-credentials` | keep or remove this host's credentials in the OS keyring |
 | `--secure` | verify the iDRAC's TLS certificate |
@@ -810,7 +880,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
 
 ## Version
 
-Current version: **0.4.2**. Print it with `python3 ragdoll.py --version`.
+Current version: **0.4.5**. Print it with `python3 ragdoll.py --version`.
 
 Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.

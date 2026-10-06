@@ -8,10 +8,62 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.4.2 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.4.5 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+## [0.4.5] - 2026-10-06
+
+### Changed
+- `--source lmsensors --host` now connects with the `paramiko` module instead of running the `ssh` command. One
+  connection is kept for the whole run and reused for every read: a four-metric `--list` took 0.8 s in all, and
+  `--tail --poll 1` gives a reading every second. A dropped connection is reopened once.
+- Host keys are checked strictly against `~/.ssh/known_hosts`: an unknown host is refused and a changed key is refused
+  with a warning, and ragdoll never writes to the file. Login uses the ssh agent and key files, never a password.
+- `~/.ssh/config` is read for `HostName`, `User`, `Port`, `IdentityFile` and `ProxyCommand`; `--user` overrides `User`.
+- The `ssh` command (batch mode, with `--`) is still used when paramiko is not installed or the host's config uses
+  `ProxyJump`.
+- Clear messages for an unknown host key, a changed host key, a refused login, an unreachable or unknown host, and a
+  missing `sensors` command.
+
+### Added
+- `paramiko` in `requirements.txt`.
+
+## [0.4.4] - 2026-10-06
+
+### Added
+- `--source lmsensors --host HOST` runs `sensors -j` on HOST over ssh, for every command that works with the source
+  (`--list lmsensors`, `--get`, `--tail`, charts, `--db`). `--user` is the ssh login name. Without `--host` it still
+  reads this computer. The cache and database are named after the host.
+- ssh runs in batch mode (`BatchMode=yes`, a 10 second connect timeout, `LogLevel=ERROR`), so it never waits for a
+  password; it uses your keys, the ssh agent and `~/.ssh/config`. Failures give ssh's own message with a hint, and a
+  missing `sensors` command on the other computer is reported as such.
+- A `--host` or `--user` that starts with `-` or contains a space is rejected, and the command is run with `--`, so
+  neither can be taken as an ssh option. `--pass` is rejected, since ssh is not given a password.
+
+### Changed
+- `--host` with `--source lmsensors` used to be rejected; it now selects the computer to read.
+
+## [0.4.3] - 2026-10-06
+
+### Added
+- `--source lmsensors` reads the sensors of the computer ragdoll runs on, through `sensors -j` from lm-sensors:
+  `temperature`, `fan`, `voltage` and `power` (currents are named `...-current` and shown in amps). Sensors are named
+  `<chip>-<label>`, for example `coretemp-isa-0000-package-id-0`. lm-sensors' `crit`, `max`, `min` and `lcrit` become
+  the limits, so `--list` and `--limits` show them.
+- It needs no `--host` (and rejects one, since the readings are not from that host) and no credentials; the computer's
+  hostname names it in the cache and the database.
+- With no `--sensor`, it picks the CPU package, `tctl`, a drive's `composite`, or a `cpu` sensor, else the first one.
+- `--get`, `--tail`, `--output`, `--db` and the cache work with it as with SNMP. It is listed only by name
+  (`--list lmsensors`), not as part of a host's `--list`.
+- A clear error when the `sensors` command is missing, fails, or is too old to give JSON.
+
+### Changed
+- `--host` is no longer required by the parser; it is still required for every source except a local one.
+- `--get` now checks the metric against the source, so `--source lmsensors --metric health` is rejected up front, and its
+  errors no longer say "Failed to read None".
+- The code that takes a reading and appends it to the cache is shared by the snmp and lmsensors sources.
 
 ## [0.4.2] - 2026-10-06
 
