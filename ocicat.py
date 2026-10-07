@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Redfish/API/GUI/DRAC/Other Log Linter - Converts iDRAC Telemetry and other information into more useful formats
+"""Out-of-band Collector of Inventory, Charts And Telemetry - Converts iDRAC Telemetry and other information into more useful formats
 
 Currently reads iDRAC temperature, fan and power data (web interface or SNMP) and graphs it in the terminal.
 
@@ -53,8 +53,8 @@ def install_missing_modules():
     """Install any module in REQUIRED_MODULES that cannot be found, with this interpreter's pip.
 
     find_spec only looks for the module, so the check costs nothing when everything is installed. --no-install or
-    RAGDOLL_NO_INSTALL=1 turns it off; the modules that are optional keep falling back as before."""
-    if "--no-install" in sys.argv[1:] or os.environ.get("RAGDOLL_NO_INSTALL"):
+    OCICAT_NO_INSTALL=1 turns it off; the modules that are optional keep falling back as before."""
+    if "--no-install" in sys.argv[1:] or os.environ.get("OCICAT_NO_INSTALL"):
         return
     missing = [req for mod, req in REQUIRED_MODULES.items() if importlib.util.find_spec(mod) is None]
     if not missing:
@@ -75,7 +75,7 @@ install_missing_modules()
 import requests
 import urllib3
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 
 class SourceError(Exception):
@@ -315,7 +315,7 @@ CHART_FLAGS = {"horizontal": [], "vertical": ["--vertical"],
                "stacked": ["--stacked"], "histogram": ["--histogram"]}
 
 
-# Times are kept in UTC everywhere inside ragdoll: as ISO 8601 text in the cache and --raw output, and as Unix
+# Times are kept in UTC everywhere inside ocicat: as ISO 8601 text in the cache and --raw output, and as Unix
 # timestamps in the database and in memory. They are converted to local time only for display.
 CSV_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # The iDRAC's own CSV uses its wall clock with no time zone, e.g. "Wed Sep 19 10:12:52 2018"
@@ -399,7 +399,8 @@ def select_last(data, last):
     return [row for row in data if row[0] >= cutoff]
 
 
-KEYRING_SERVICE = "ragdoll:{host}"
+KEYRING_SERVICE = "ocicat:{host}"
+LEGACY_KEYRING_SERVICE = "ragdoll:{host}"  # the name before 0.5.3: credentials saved then are still found
 CREDENTIAL_ENV = {"user": "IDRAC_USER", "password": "IDRAC_PASS", "community": "IDRAC_COMMUNITY"}
 DEFAULT_COMMUNITY = "public"
 
@@ -408,7 +409,8 @@ def keyring_get(host, field):
     """Read one saved credential for a host, or None if there is none or no keyring backend."""
     try:
         import keyring
-        return keyring.get_password(KEYRING_SERVICE.format(host=host), field)
+        return (keyring.get_password(KEYRING_SERVICE.format(host=host), field)
+                or keyring.get_password(LEGACY_KEYRING_SERVICE.format(host=host), field))
     except Exception:  # missing module, no backend, locked keyring
         return None
 
@@ -430,13 +432,15 @@ def keyring_forget(host):
         raise SourceError("keyring not found; install with: pip install keyring")
     removed = []
     for field in CREDENTIAL_ENV:
-        try:
-            keyring.delete_password(KEYRING_SERVICE.format(host=host), field)
-            removed.append(field)
-        except keyring.errors.PasswordDeleteError:
-            pass  # nothing saved under that name
-        except Exception as e:
-            raise SourceError(f"could not use the OS keyring: {e}")
+        for service in (KEYRING_SERVICE, LEGACY_KEYRING_SERVICE):  # a credential saved before 0.5.3 goes too
+            try:
+                keyring.delete_password(service.format(host=host), field)
+                if field not in removed:
+                    removed.append(field)
+            except keyring.errors.PasswordDeleteError:
+                pass  # nothing saved under that name
+            except Exception as e:
+                raise SourceError(f"could not use the OS keyring: {e}")
     return removed
 
 
@@ -464,12 +468,14 @@ def save_credentials(args):
 
 def default_cache_dir():
     base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
-    return Path(base) / "ragdoll"
+    legacy = Path(base) / "ragdoll"  # the name before 0.5.3: history kept there is used until it is moved
+    return legacy if legacy.is_dir() and not (Path(base) / "ocicat").exists() else Path(base) / "ocicat"
 
 
 def default_db_path():
     base = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
-    return Path(base) / "ragdoll" / "ragdoll.db"
+    legacy = Path(base) / "ragdoll" / "ragdoll.db"  # the name before 0.5.3
+    return legacy if legacy.is_file() and not (Path(base) / "ocicat" / "ocicat.db").exists() else Path(base) / "ocicat" / "ocicat.db"
 
 
 DB_VERSION = 2  # 1 stored local-time text; 2 stores UTC Unix timestamps
@@ -602,9 +608,9 @@ def parse_args():
                                 epilog=paragraphs[2].replace("\n", " "))
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--no-install", action="store_true",
-                   help="do not install missing Python modules with pip at startup (or set RAGDOLL_NO_INSTALL=1)")
+                   help="do not install missing Python modules with pip at startup (or set OCICAT_NO_INSTALL=1)")
     p.add_argument("--host", help="iDRAC address, e.g. 192.168.8.98. With --source lmsensors or system it is optional: without it "
-                                  "this computer is read, with it ragdoll runs the commands on that computer over ssh")
+                                  "this computer is read, with it ocicat runs the commands on that computer over ssh")
     p.add_argument("--user", "--username", dest="user", help="iDRAC username (web source; else $IDRAC_USER or the keyring)")
     p.add_argument("--pass", "--password", dest="password",
                    help="iDRAC password (web source; else $IDRAC_PASS, the keyring, or a prompt)")
@@ -1004,7 +1010,7 @@ def load_limits(args):
         return None
 
 
-# --- lmsensors: the sensors of the computer ragdoll runs on, read with `sensors -j` (from the lm-sensors package) ---
+# --- lmsensors: the sensors of the computer ocicat runs on, read with `sensors -j` (from the lm-sensors package) ---
 LM_TYPES = {"temp": "temperature", "fan": "fan", "in": "voltage", "power": "power", "curr": "power"}
 # lm-sensors limits and the limit each one becomes
 LM_LIMITS = {"crit": "upper_critical", "max": "upper_warning", "min": "lower_warning", "lcrit": "lower_critical"}
@@ -1083,7 +1089,7 @@ def ssh_connect(args, password=None):
                           f"a key or the ssh agent, never a password: check that `ssh {user}@{args.host}` works without a prompt)")
     except paramiko.SSHException as e:
         if "not found in known_hosts" in str(e):
-            raise SourceError(f"the ssh host key of {args.host} is not in ~/.ssh/known_hosts, and ragdoll will not accept it "
+            raise SourceError(f"the ssh host key of {args.host} is not in ~/.ssh/known_hosts, and ocicat will not accept it "
                               f"on its own: run `ssh {user}@{args.host}` once and check the key it shows")
         raise SourceError(f"ssh to {args.host} failed: {e}")
     except (OSError, EOFError) as e:  # no route, refused, timed out, name not found
@@ -2162,12 +2168,12 @@ RACADM_STATUS = {"OK": "ok", "Warning": "non-critical", "Critical": "critical", 
 RACADM_TIMEOUT = 180  # hwinventory takes about 30 s on an iDRAC8
 
 
-IDRAC_LOCK_WAIT = 600  # seconds to queue behind another ragdoll that is using racadm on the same iDRAC
+IDRAC_LOCK_WAIT = 600  # seconds to queue behind another ocicat that is using racadm on the same iDRAC
 
 
 @contextlib.contextmanager
 def idrac_lock(args, wait=None):
-    """Let only one ragdoll at a time use an iDRAC's racadm or WS-Man logins; others queue behind it.
+    """Let only one ocicat at a time use an iDRAC's racadm or WS-Man logins; others queue behind it.
 
     An iDRAC allows few ssh and racadm sessions and can lock an account out, so these are never run in parallel, by this
     process or by another one (a cron job overlapping a manual run). The racadm and wsman sources share this lock. It is
@@ -2189,10 +2195,10 @@ def idrac_lock(args, wait=None):
                 break
             except BlockingIOError:
                 if time.monotonic() > deadline:
-                    raise SourceError(f"another ragdoll has been using {args.host} for more than {wait:g} seconds "
+                    raise SourceError(f"another ocicat has been using {args.host} for more than {wait:g} seconds "
                                       f"(it holds {path}); try again when it has finished")
                 if not told and sys.stderr.isatty():
-                    print(f"Waiting for another ragdoll that is using {args.host}...", file=sys.stderr)
+                    print(f"Waiting for another ocicat that is using {args.host}...", file=sys.stderr)
                     told = True
                 time.sleep(1)
         try:
@@ -2320,7 +2326,7 @@ def read_inventory_racadm(args, only_category=None):
         commands.append("swinventory")
     if any(want(entry[0]) for entry in RACADM_HW.values()):
         commands.append("hwinventory")
-    # one command at a time, over the one connection, and one ragdoll at a time per iDRAC: an iDRAC allows few ssh and
+    # one command at a time, over the one connection, and one ocicat at a time per iDRAC: an iDRAC allows few ssh and
     # racadm sessions and can lock an account out, so this is slower (each command takes 10 s or more on an iDRAC8)
     # but safe
     with idrac_lock(args):
@@ -2370,7 +2376,7 @@ def racadm_fetch(args):
 
 # --- wsman: the inventory over WS-Man (HTTPS), with the python-dracclient module ---
 # No ssh and no racadm are needed. python-dracclient is OpenStack's iDRAC client; it covers part of the inventory. Its
-# transport is wrapped so that --secure is honoured (it hard-codes verify=False) and a hung iDRAC cannot hang ragdoll
+# transport is wrapped so that --secure is honoured (it hard-codes verify=False) and a hung iDRAC cannot hang ocicat
 # (it sets no timeout). A refused login (HTTP 401) is raised at once and is never retried by the module.
 WSMAN_STATUS = {"ok": "ok", "warning": "non-critical", "critical": "critical", "unknown": "unknown"}
 WSMAN_TIMEOUT = 60

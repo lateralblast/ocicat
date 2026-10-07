@@ -8,10 +8,25 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.5.2 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.5.3 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+## [0.5.3] - 2026-10-07
+
+### Changed
+- The tool is renamed from ragdoll to **ocicat**, for **O**ut-of-band **C**ollector of **I**nventory, **C**harts **A**nd
+  **T**elemetry (it was "Redfish/API/GUI/DRAC/Other Log Linter"). The script is now `ocicat.py`, and the README, `--help`
+  and messages say ocicat. The entries below this one keep the name they were written under.
+- The environment variable is `OCICAT_NO_INSTALL`, the keyring service is `ocicat:<host>`, and the default cache and
+  database are `~/.cache/ocicat` and `~/.local/share/ocicat/ocicat.db`.
+- The README logo is still `ragdoll.jpg`, which is a picture of the old name.
+
+### Added
+- Nothing stored under the old name is lost: credentials saved as `ragdoll:<host>` are still read (and
+  `--forget-credentials` deletes both), and `~/.cache/ragdoll` and `~/.local/share/ragdoll/ragdoll.db` are used while they
+  exist and the new locations do not.
 
 ## [0.5.2] - 2026-10-06
 

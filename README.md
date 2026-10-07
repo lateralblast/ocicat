@@ -1,10 +1,10 @@
-![ragdoll](ragdoll.jpg)
+![ocicat](ocicat.png)
 
-# ragdoll
+# ocicat
 
-Redfish/API/GUI/DRAC/Other Log Linter - Converts iDRAC Telemetry and other information into more useful formats.
+Out-of-band Collector of Inventory, Charts And Telemetry - Converts iDRAC Telemetry and other information into more useful formats.
 
-ragdoll reads telemetry from a Dell iDRAC and turns it into something you can use: a chart in the terminal, a table,
+ocicat reads telemetry from a Dell iDRAC and turns it into something you can use: a chart in the terminal, a table,
 CSV, or an Excel spreadsheet. It currently reads temperatures, fan speeds, power, voltage, component health and
 management-network traffic, through the iDRAC's web interface, SNMP or Redfish. It can also read the computer it
 is running on, through lm-sensors.
@@ -28,44 +28,44 @@ This installs `requests` (web source), `pysnmp` (snmp source), `paramiko` (ssh, 
 output), `XlsxWriter` and `xlwt` (`.xlsx` and `.xls` output), and the two graphing modules, `plotext` and `termgraph`.
 `plotext` is pinned to 5.3.2 because 6.x has a different API.
 
-If any of these modules is missing when ragdoll starts, it installs them itself with `python3 -m pip install` (the pip of
+If any of these modules is missing when ocicat starts, it installs them itself with `python3 -m pip install` (the pip of
 the Python running it, with `--user` for a system Python it cannot write to) and says so on stderr. `--no-install`, or
-`RAGDOLL_NO_INSTALL=1` in the environment, turns this off. If pip fails (for example on a Python marked as externally
-managed), ragdoll prints a warning and carries on; use a virtual environment there.
+`OCICAT_NO_INSTALL=1` in the environment, turns this off. If pip fails (for example on a Python marked as externally
+managed), ocicat prints a warning and carries on; use a virtual environment there.
 
 On Linux, the `lmsensors` source also needs the `lm-sensors` package, which is a system package and not a Python one (for example
 `sudo apt install lm-sensors`, then `sudo sensors-detect` once to find the hardware). Nothing else needs it.
 
-ragdoll is a single script, `ragdoll.py`. It was written and tested with Python 3.14 and uses the standard `zoneinfo`
+ocicat is a single script, `ocicat.py`. It was written and tested with Python 3.14 and uses the standard `zoneinfo`
 module, so it needs at least Python 3.9; older versions have not been tried.
 
 ## Quick start
 
 ```
 # what can this iDRAC tell me? (web credentials are only needed for the web source)
-python3 ragdoll.py --host 192.0.2.20 --list
+python3 ocicat.py --host 192.0.2.20 --list
 
 # the current inlet temperature, read over SNMP
-python3 ragdoll.py --host 192.0.2.20 --get
+python3 ocicat.py --host 192.0.2.20 --get
 
 # a line chart of the last day of inlet temperature from the web interface
-python3 ragdoll.py --host 192.0.2.10 --user <user> --pass <password> --last day --chart line
+python3 ocicat.py --host 192.0.2.10 --user <user> --pass <password> --last day --chart line
 ```
 
 Credentials do not have to be typed each time: see [Credentials](#credentials).
 
 ## Sources and metrics
 
-ragdoll reads from seven sources, chosen with `--source` (`gui` is accepted as another name for `web`):
+ocicat reads from seven sources, chosen with `--source` (`gui` is accepted as another name for `web`):
 
 | Source | Metrics | How it works | History |
 |---|---|---|---|
 | `web` (default; also `gui`) | temperature | Logs in to the iDRAC web interface and downloads the temperature statistics CSV | Hourly history held by the iDRAC |
-| `lmsensors` | temperature, fan, power, voltage | Reads the sensors of the computer ragdoll runs on, through `sensors -j` from lm-sensors (on macOS, from the HID sensors, the SMC and the battery, see [below](#macos)). No `--host` or login needed | Only the current value; each run appends a reading to the local cache, as with snmp |
+| `lmsensors` | temperature, fan, power, voltage | Reads the sensors of the computer ocicat runs on, through `sensors -j` from lm-sensors (on macOS, from the HID sensors, the SMC and the battery, see [below](#macos)). No `--host` or login needed | Only the current value; each run appends a reading to the local cache, as with snmp |
 | `wsman` | none: the [hardware inventory](#hardware-inventory) only | Reads part of the inventory over WS-Man (HTTPS) with the `python-dracclient` module: no ssh and no racadm | The inventory is a snapshot, so there is no history |
 | `racadm` | none: the [hardware inventory](#hardware-inventory) only | Runs Dell's `racadm` commands (`hwinventory`, `swinventory`, `getsysinfo`) in the iDRAC's ssh shell | The inventory is a snapshot, so there is no history |
 | `redfish` | none: the [hardware inventory](#hardware-inventory) only | Reads the inventory from the iDRAC's Redfish API over HTTPS | The inventory is a snapshot, so there is no history |
-| `system` | none: the [hardware inventory](#hardware-inventory) only | Reads the inventory of the computer ragdoll runs on (or `--host` over ssh) with `system_profiler` on macOS and `dmidecode` on Linux | The inventory is a snapshot, so there is no history |
+| `system` | none: the [hardware inventory](#hardware-inventory) only | Reads the inventory of the computer ocicat runs on (or `--host` over ssh) with `system_profiler` on macOS and `dmidecode` on Linux | The inventory is a snapshot, so there is no history |
 | `snmp` | temperature, fan, power, voltage, health, network | Reads the current value from the Dell probe tables (and the standard interface counters) over SNMP v2c | Only the current value; each run appends a reading to the local cache, so history builds up over time |
 
 `--metric` chooses what to read (default `temperature`) and `--sensor` picks one sensor of that metric. Every metric
@@ -119,7 +119,7 @@ different numbering and are not used; the status of each of those is.
 ### Network traffic
 
 `network` reads the byte counters of the iDRAC's own network interfaces (`bond0-in`, `bond0-out`; loopback is left
-out). A counter only ever grows, so ragdoll stores the counter and shows the **rate in bytes per second** between
+out). A counter only ever grows, so ocicat stores the counter and shows the **rate in bytes per second** between
 consecutive readings. That needs at least two readings, so the first run explains what to do, and later runs (or a
 cron job) fill it in. A reading lower than the one before, which happens when the iDRAC restarts, is skipped. This is
 traffic on the management port, not on the server's own network ports. The `--raw` flag shows the stored counter.
@@ -138,7 +138,7 @@ reported on stderr and skipped. A source or metric after `--list` narrows it (`-
 `--source` and `--metric`.
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --list temperature
+$ python3 ocicat.py --host 192.0.2.20 --list temperature
 SOURCE  METRIC       SENSOR   UNIT  VALUE  LIMITS                  KEY
 snmp    temperature  cpu1     °C       23  warn 8..82 crit 3..87   1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.3
 snmp    temperature  cpu2     °C       26  warn 8..82 crit 3..87   1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.4
@@ -174,7 +174,7 @@ of their own (`lower_critical`, `lower_warning`, `upper_warning`, `upper_critica
 A missing value or limit is an empty cell.
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --list temperature --output csv
+$ python3 ocicat.py --host 192.0.2.20 --list temperature --output csv
 source,metric,sensor,unit,value,lower_critical,lower_warning,upper_warning,upper_critical,key
 snmp,temperature,cpu1,°C,23,3,8,82,87,1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.3
 snmp,temperature,cpu2,°C,26,3,8,82,87,1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.4
@@ -182,7 +182,7 @@ snmp,temperature,exhaust,°C,26,0,0,70,75,1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1
 snmp,temperature,inlet,°C,16,-7,3,42,47,1.3.6.1.4.1.674.10892.5.4.700.20.1.6.1.1
 web,temperature,inlet,°C,14,-7,3,42,47,iDRAC.Embedded.1#Inlet.1#ThermalHistory
 
-$ python3 ragdoll.py --host 192.0.2.20 --source snmp --metric fan --list --output xlsx
+$ python3 ocicat.py --host 192.0.2.20 --source snmp --metric fan --list --output xlsx
 Wrote 14 sensors to 192.0.2.20_sensors_snmp_fan.xlsx
 ```
 
@@ -205,7 +205,7 @@ Status values are `ok`, `non-critical`, `critical` and so on, as in the health m
 MHz. Items are in category order and, within a category, in natural order (`DIMM.Socket.A2` before `A10`).
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --list inventory
+$ python3 ocicat.py --host 192.0.2.20 --list inventory
 CATEGORY      NAME                                     DETAILS
 system        system                                   model=PowerEdge R630; name=r630xp1; service-tag=XXXXXXX
 idrac         idrac                                    product=iDRAC8; firmware=2.86.86.86; manufacturer=Dell Inc.
@@ -232,7 +232,7 @@ default for the inventory stays `snmp`. It needs the web credentials (`--user` a
 of the SNMP community.
 
 ```
-python3 ragdoll.py --host 192.0.2.20 --source redfish --get inventory --category memory --name DIMM.Socket.A1
+python3 ocicat.py --host 192.0.2.20 --source redfish --get inventory --category memory --name DIMM.Socket.A1
 ```
 
 Everything else works the same: `--category`, `--name`, `--detail`, `--field` and every `--output`. The two sources
@@ -255,7 +255,7 @@ most complete source: every category, with exact RAID layouts (`RAID 5`, not `RA
 firmware items and the four storage controllers.
 
 ```
-python3 ragdoll.py --host 192.0.2.20 --source racadm --get inventory --category memory --name DIMM.Socket.A1
+python3 ocicat.py --host 192.0.2.20 --source racadm --get inventory --category memory --name DIMM.Socket.A1
 ```
 ```
 CATEGORY  NAME            DETAILS
@@ -265,20 +265,20 @@ memory    DIMM.Socket.A1  size=32 GiB; speed=2133 MHz; type=DDR-4; manufacturer=
 - **No racadm needed on this computer.** The commands run on the iDRAC itself, in its ssh shell, so a computer without
   Dell's `racadm` installed works as well (tested with `racadm` removed from the search path). There is no Python module that
   wraps racadm: the one called `racadm` on PyPI is an empty placeholder.
-- **How it connects:** ragdoll logs in to the iDRAC's own ssh shell with paramiko, using the web credentials (`--user` and
+- **How it connects:** ocicat logs in to the iDRAC's own ssh shell with paramiko, using the web credentials (`--user` and
   `--pass`, the keyring or the environment), and runs `racadm getsysinfo -s`, `racadm swinventory` and
   `racadm hwinventory` there. The password is sent over the ssh connection, so it never appears in a process list, and
   the iDRAC's host key is checked against `~/.ssh/known_hosts` like any other (ssh to the iDRAC once first). The iDRAC's
   ssh service must be enabled, which it is by default.
 - **Fallback:** if ssh to the iDRAC cannot be reached at all (or paramiko is not installed) and `racadm` is installed on
-  this computer, ragdoll runs `racadm -r <host> -u <user> -p <password> --nocertwarn ...` instead. That works, but the
+  this computer, ocicat runs `racadm -r <host> -u <user> -p <password> --nocertwarn ...` instead. That works, but the
   password is then visible to other users in the process list while it runs. A refused login is not retried this way.
-- **Never in parallel:** an iDRAC allows few ssh and racadm sessions and can lock an account out, so ragdoll runs one
-  command at a time over a single ssh login, and never two ragdoll processes at once on the same iDRAC. A second ragdoll
+- **Never in parallel:** an iDRAC allows few ssh and racadm sessions and can lock an account out, so ocicat runs one
+  command at a time over a single ssh login, and never two ocicat processes at once on the same iDRAC. A second ocicat
   (a cron job overlapping a manual run, say) waits for the first, using a lock file per host in the cache directory
   (`<host>.idrac.lock`, shared with the `wsman` source), and carries on when it finishes; it gives up with a message after ten minutes. The lock is
   released if the first process crashes. One login is made per run, and a refused login is never retried. If the
-  iDRAC says it has no free racadm sessions (someone else is using them), ragdoll waits a few seconds and tries again,
+  iDRAC says it has no free racadm sessions (someone else is using them), ocicat waits a few seconds and tries again,
   twice at most.
 - **Speed:** each command takes 10 seconds or more on an iDRAC8, and `hwinventory` about 25, so the whole inventory takes
   about 40 seconds and `--category system` or `--category bios` about 11. A category such as `memory` needs the full
@@ -296,7 +296,7 @@ tools use) with the `python-dracclient` module, so it needs neither ssh nor raca
 sources, and one category takes only a few seconds, but it covers less.
 
 ```
-python3 ragdoll.py --host 192.0.2.20 --source wsman --get inventory --category cpu
+python3 ocicat.py --host 192.0.2.20 --source wsman --get inventory --category cpu
 ```
 
 - **Coverage:** `system` (model, service tag, power state), `cpu`, `memory`, `nic`, `controller`, `disk` and `virtual-disk`
@@ -305,19 +305,19 @@ python3 ragdoll.py --host 192.0.2.20 --source wsman --get inventory --category c
 - **Speed:** 31 seconds for everything on the test iDRAC, and 2 to 6 seconds for one category.
 - **Credentials:** the web credentials. A refused login stops after one attempt. Requests are made one at a time, under the
   same per-iDRAC lock as racadm.
-- **TLS:** the module hard-codes "do not verify certificates" and has no timeout. ragdoll replaces both, so `--secure` works
+- **TLS:** the module hard-codes "do not verify certificates" and has no timeout. ocicat replaces both, so `--secure` works
   (it fails on a self-signed certificate, as you would expect) and a request is given up after 60 seconds.
 - **Install:** `pip install python-dracclient six`. The module imports `six` without declaring it, so it must be installed
   as well. Without the module the source says so and how to install it.
 
-**This computer.** `--source system` reads the inventory of the computer ragdoll runs on: `system_profiler` on macOS,
+**This computer.** `--source system` reads the inventory of the computer ocicat runs on: `system_profiler` on macOS,
 and `dmidecode` on Linux. Like `lmsensors`, it needs no `--host` and no login, and with `--host` (and `--user`) it runs
 the same commands on that computer over ssh, with the same rules: a key or the ssh agent, never a password, and host keys
 checked strictly against `~/.ssh/known_hosts`. The categories and attribute names are the same as for an iDRAC.
 
 ```
-python3 ragdoll.py --source system --list inventory
-python3 ragdoll.py --source system --host 192.0.2.30 --user <user> --get inventory --category memory
+python3 ocicat.py --source system --list inventory
+python3 ocicat.py --source system --host 192.0.2.30 --user <user> --get inventory --category memory
 ```
 
 ```
@@ -336,7 +336,7 @@ disk        disk0                 model=APPLE SSD AP1024R; serial=XXXXXXXXXX; fi
   `memory`, `nic`, `pci` (the GPU, and PCI cards on Macs that have slots), `controller` and `disk`. On Apple silicon the
   memory is part of the chip, so it is one item with no slots.
 - **Linux:** `dmidecode` gives `system`, `bios`, `cpu` (one item per socket) and `memory` (one per DIMM, named by its slot,
-  such as `A1`). It needs root, so ragdoll runs it as is and then with `sudo -n` (which never asks for a password). If
+  such as `A1`). It needs root, so ocicat runs it as is and then with `sudo -n` (which never asks for a password). If
   both are refused it says so, takes the system and BIOS from `/sys/class/dmi/id` (without the serial number, which only
   root can read) and leaves out the CPUs and memory. Network ports come from `/sys/class/net` (physical ports only, with
   link, speed and driver), disks from `lsblk` (a RAID controller's volumes, such as a PERC's, are listed as `virtual-disk`,
@@ -346,7 +346,7 @@ disk        disk0                 model=APPLE SSD AP1024R; serial=XXXXXXXXXX; fi
   pointing to the inventory.
 
 **Redfish is slow on an iDRAC8.** With a password, every request takes 5 to 9 seconds, because the iDRAC checks it
-each time. ragdoll therefore logs in once with a session token (about 10 seconds), after which each request takes under
+each time. ocicat therefore logs in once with a session token (about 10 seconds), after which each request takes under
 a second, and logs out at the end; it makes a few requests at a time. A full inventory took 43 seconds, and one
 category such as `--category cpu` about 12. SNMP takes 5 seconds for everything.
 
@@ -355,7 +355,7 @@ category such as `--category cpu` about 12. SNMP takes 5 seconds for everything.
 items with that name. They can be used together, and they work with `--list inventory` and `--get inventory`:
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --get inventory --category memory --name DIMM.Socket.A1
+$ python3 ocicat.py --host 192.0.2.20 --get inventory --category memory --name DIMM.Socket.A1
 CATEGORY  NAME            DETAILS
 memory    DIMM.Socket.A1  size=32 GiB; speed=2133 MHz; manufacturer=Samsung; part-number=M386A4G40DM0-CPB; serial=XXXXXXXX; status=ok
 ```
@@ -374,12 +374,12 @@ memory    DIMM.Socket.A1  size=32 GiB; speed=2133 MHz; manufacturer=Samsung; par
 attribute, for example the BIOS version:
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --get inventory --name bios --detail version
+$ python3 ocicat.py --host 192.0.2.20 --get inventory --name bios --detail version
 2.19.0
-$ python3 ragdoll.py --host 192.0.2.20 --get inventory --category virtual-disk --detail layout
+$ python3 ocicat.py --host 192.0.2.20 --get inventory --category virtual-disk --detail layout
 RAID 1
 RAID 5
-$ python3 ragdoll.py --host 192.0.2.20 --get inventory --category disk --detail firmware | sort | uniq -c
+$ python3 ocicat.py --host 192.0.2.20 --get inventory --category disk --detail firmware | sort | uniq -c
       9 8EET6101
       1 8EET6103
 ```
@@ -388,7 +388,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --get inventory --category disk --detail 
   example `version`, `released`, `manufacturer` and `status` for the BIOS, or `size`, `speed`, `part-number`, `serial`
   and `status` for memory.
 - In plain text the values are bare, one per line with no heading, so they can go into a script:
-  `bios=$(python3 ragdoll.py --host 192.0.2.20 --get inventory --name bios --detail version)`. With several items the
+  `bios=$(python3 ocicat.py --host 192.0.2.20 --get inventory --name bios --detail version)`. With several items the
   names are not printed; add `--output table` to see them (`CATEGORY`, `NAME` and the detail as its own column), or
   `--output csv`, `xlsx` or `xls`, which give the usual `category,name,attribute,value` rows for just that attribute.
 - Items that do not have the detail are left out (`--detail size` skips the CPUs, for instance). If no item has it,
@@ -407,20 +407,20 @@ It uses `--source snmp` unless told otherwise, and `--metric` and `--sensor` cho
 `temperature` and `inlet`, or the default sensor of the metric).
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --get
+$ python3 ocicat.py --host 192.0.2.20 --get
 16 °C
-$ python3 ragdoll.py --host 192.0.2.20 --metric fan --sensor fan1a --get
+$ python3 ocicat.py --host 192.0.2.20 --metric fan --sensor fan1a --get
 3840 RPM
-$ python3 ragdoll.py --host 192.0.2.20 --metric power --sensor system-power --get
+$ python3 ocicat.py --host 192.0.2.20 --metric power --sensor system-power --get
 112 W
-$ python3 ragdoll.py --host 192.0.2.20 --metric health --sensor system --get
+$ python3 ocicat.py --host 192.0.2.20 --metric health --sensor system --get
 3 code
 ```
 
 - **Nothing is stored.** `--get` does not touch the cache or a database, even with `--db`. To record readings, poll
   the sensor normally.
 - **In a script:** `--field value` prints just the number (see [Picking one field](#picking-one-field)):
-  `temp=$(python3 ragdoll.py --host 192.0.2.20 --get --field value)`. Without it the output is the number, a space and
+  `temp=$(python3 ocicat.py --host 192.0.2.20 --get --field value)`. Without it the output is the number, a space and
   the unit. A failure prints a message on stderr and exits with status 1.
 - **Counters:** a network counter has no value of its own, so `--metric network --get` reads it twice, 2 seconds apart,
   and prints the rate in bytes per second (`2184.523 B/s`).
@@ -436,11 +436,11 @@ $ python3 ragdoll.py --host 192.0.2.20 --metric health --sensor system --get
 `--field` returns just one field (column) of what `--list` or `--get` would print. It is not case-sensitive.
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --get inventory --category system --field details
+$ python3 ocicat.py --host 192.0.2.20 --get inventory --category system --field details
 model=PowerEdge R630; name=r630xp1; service-tag=XXXXXXX
-$ python3 ragdoll.py --host 192.0.2.20 --get --field value
+$ python3 ocicat.py --host 192.0.2.20 --get --field value
 16
-$ python3 ragdoll.py --host 192.0.2.20 --list fan --field sensor
+$ python3 ocicat.py --host 192.0.2.20 --list fan --field sensor
 fan1a
 fan1b
 fan2a
@@ -480,7 +480,7 @@ time zone.
   (poll the sensor over SNMP first), or the chart is not a plotext line or scatter chart, it says so on stderr.
 
 ```
-python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor inlet --last day --chart line --limits
+python3 ocicat.py --host 192.0.2.20 --source snmp --sensor inlet --last day --chart line --limits
 ```
 
 ## Other outputs
@@ -494,7 +494,7 @@ python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor inlet --last day --c
 | `table` | a table, oldest first |
 | `csv` | CSV for spreadsheets, databases and scripts |
 | `json` | a JSON array, one object per reading |
-| `raw` | CSV in the form ragdoll stores |
+| `raw` | CSV in the form ocicat stores |
 | `xlsx`, `xls` | a spreadsheet, named with `--file` |
 
 ### Table
@@ -507,7 +507,7 @@ column is in local time, or the zone given with `--tz` or `--utc`, and the zone 
 - **`--output csv`** gives each row everything that identifies it, so files from different hosts or sensors can be
   joined: `time,host,source,metric,sensor,average,peak,unit`. The time is ISO 8601 with its UTC offset, in local time
   or the zone from `--tz` or `--utc`.
-- **`--output raw`** is the form ragdoll itself stores: `Average,Peak,Time`, with UTC times ending in `Z`. It is what
+- **`--output raw`** is the form ocicat itself stores: `Average,Peak,Time`, with UTC times ending in `Z`. It is what
   is kept in the cache.
 
 `--output raw` is not the same as the older `--raw` flag. `--raw` prints every stored reading, ignores `--last`, and
@@ -522,7 +522,7 @@ escaped (`"°C"` stays `"°C"`). Times are ISO 8601 with their UTC offset, in lo
 as in the CSV.
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 2 --output json
+$ python3 ocicat.py --host 192.0.2.20 --source gui --last 2 --output json
 [
   {
     "time": "2026-10-06T17:00:30+11:00",
@@ -551,7 +551,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --source gui --last 2 --output json
   it arrives (`... --tail --output json | jq .average`).
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --get --output json
+$ python3 ocicat.py --host 192.0.2.20 --get --output json
 {
   "source": "snmp",
   "metric": "temperature",
@@ -573,10 +573,10 @@ $ python3 ragdoll.py --host 192.0.2.20 --get --output json
 `--output xlsx` writes an Excel workbook, and `--output xls` writes the older Excel 97-2003 format.
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --source gui --last week --output xlsx
+$ python3 ocicat.py --host 192.0.2.20 --source gui --last week --output xlsx
 Wrote 104 readings to 192.0.2.20_web_temperature-inlet_last-1w.xlsx
 
-$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 3 --output xls --file inlet.xls
+$ python3 ocicat.py --host 192.0.2.20 --source gui --last 3 --output xls --file inlet.xls
 Wrote 3 readings to inlet.xls
 ```
 
@@ -596,7 +596,7 @@ Wrote 3 readings to inlet.xls
 
 ## Time zones
 
-Times from the two sources are in different clocks, so ragdoll converts everything to **UTC** when it reads or
+Times from the two sources are in different clocks, so ocicat converts everything to **UTC** when it reads or
 polls, and stores it that way: as ISO 8601 text ending in `Z` in the cache and `--output raw`, and as Unix
 timestamps in the database. Charts and tables convert back to your computer's local time, and the time zone name is
 shown in the title (for example `[AEDT]`).
@@ -612,7 +612,7 @@ Where the times come from:
 
 - **snmp:** the iDRAC does not report a time over SNMP, so each reading is stamped with this computer's clock at the
   moment it was polled. Keep this computer's clock correct (for example with NTP).
-- **web:** the iDRAC's CSV uses the iDRAC's own wall clock with no time zone. ragdoll converts it to UTC using the
+- **web:** the iDRAC's CSV uses the iDRAC's own wall clock with no time zone. ocicat converts it to UTC using the
   clock's offset from UTC, which it measures by comparing the iDRAC's clock (read through Redfish) with this
   computer's clock, rounded to the nearest quarter hour. It does not trust the time zone configured on the iDRAC,
   because an iDRAC can show UTC while set to another time zone. If Redfish is unavailable, or you want to override
@@ -628,8 +628,9 @@ Where the times come from:
 
 Data is cached per host, source, metric and sensor, for example `<host>_snmp_fan-fan1a.csv`.
 
-- The location is `~/.cache/ragdoll` (or `$XDG_CACHE_HOME/ragdoll`), changed with `--cachedir` (`--cache-dir` also
-  works).
+- The location is `~/.cache/ocicat` (or `$XDG_CACHE_HOME/ocicat`), changed with `--cachedir` (`--cache-dir` also
+  works). Before 0.5.3 the tool was called ragdoll and used `~/.cache/ragdoll`: that directory is still used while it exists and
+  `ocicat` does not, so history is not lost; to switch, `mv ~/.cache/ragdoll ~/.cache/ocicat`.
 - Web data is reused until it is `--max-age` seconds old (default 3600); `--refresh` forces a fetch.
 - If a fetch fails and a cache file exists, the cache is used and a warning is printed.
 - The snmp source polls on every run, and each poll adds one reading to its cache file.
@@ -642,11 +643,11 @@ Charts are then drawn from the database, so they include readings from every ear
 and snmp.
 
 ```
-python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --db --chart line --last week
-python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --db /path/to/readings.db --raw
+python3 ocicat.py --host 192.0.2.20 --source snmp --sensor cpu1 --db --chart line --last week
+python3 ocicat.py --host 192.0.2.20 --source snmp --sensor cpu1 --db /path/to/readings.db --raw
 ```
 
-- `--db` on its own uses `~/.local/share/ragdoll/ragdoll.db` (or `$XDG_DATA_HOME/ragdoll/ragdoll.db`); `--db PATH`
+- `--db` on its own uses `~/.local/share/ocicat/ocicat.db` (or `$XDG_DATA_HOME/ocicat/ocicat.db`); a database at the old name, `~/.local/share/ragdoll/ragdoll.db`, is used while it exists and the new one does not (`mv ~/.local/share/ragdoll ~/.local/share/ocicat` and rename the file to switch); `--db PATH`
   uses a database of your choosing. It is created on first use. Without `--db`, nothing is written to a database.
 - Storing is repeatable: a reading already in the database is skipped, so each run can safely pass its whole history.
   The web source's full history (about 61,000 hourly samples) is stored on the first run and takes around a second.
@@ -663,7 +664,7 @@ One table, `readings`, with one row per sample:
 The primary key is `(host, source, metric, sensor, time)`. Query it with any SQLite tool, for example:
 
 ```
-sqlite3 ~/.local/share/ragdoll/ragdoll.db \
+sqlite3 ~/.local/share/ocicat/ocicat.db \
   "SELECT time, average FROM readings WHERE sensor = 'cpu1' ORDER BY time DESC LIMIT 10"
 ```
 
@@ -674,10 +675,10 @@ added to the cache or the database.
 
 ```
 # from the database (with --db)
-python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --db --no-fetch --chart line --last week
+python3 ocicat.py --host 192.0.2.20 --source snmp --sensor cpu1 --db --no-fetch --chart line --last week
 
 # from the cache, however old it is (without --db)
-python3 ragdoll.py --host 192.0.2.10 --no-fetch --chart line --last month
+python3 ocicat.py --host 192.0.2.10 --no-fetch --chart line --last month
 ```
 
 - With `--db` the readings come from the database; without it, from the cache file, ignoring `--max-age`.
@@ -690,12 +691,12 @@ python3 ragdoll.py --host 192.0.2.10 --no-fetch --chart line --last month
 ## This computer's sensors (lm-sensors)
 
 `--source lmsensors` reads the sensors of a computer with `sensors -j` from lm-sensors, so a desktop, server or
-laptop can be charted and logged the same way as an iDRAC. Without `--host` it reads the computer ragdoll is running
+laptop can be charted and logged the same way as an iDRAC. Without `--host` it reads the computer ocicat is running
 on, which needs no login and no network, and the computer's own hostname names it in the cache and the database. With
 `--host` it logs in to that computer over ssh and runs `sensors -j` there (see below).
 
 ```
-$ python3 ragdoll.py --source lmsensors --list
+$ python3 ocicat.py --source lmsensors --list
 SOURCE     METRIC       SENSOR                          UNIT  VALUE  LIMITS                           KEY
 lmsensors  temperature  acpitz-acpi-0-temp1             °C     27.8  -                                acpitz-acpi-0/temp1
 lmsensors  temperature  coretemp-isa-0000-core-0        °C       59  warn -..86 crit -..100           coretemp-isa-0000/Core 0
@@ -708,7 +709,7 @@ lmsensors  temperature  nvme-pci-0100-composite         °C    39.85  warn -0.15
   this computer has; it varies, and a machine without a fan or voltage sensor lists none.
 - **Metrics:** `temperature` (°C), `fan` (RPM), `voltage` (V) and `power` (W; a current is named `...-current` and shown
   in A). `--metric` chooses, and the default is temperature. `health` and `network` are not available.
-- **Default sensor:** with no `--sensor`, ragdoll picks the CPU package, `tctl`, a drive's `composite`, or a `cpu`
+- **Default sensor:** with no `--sensor`, ocicat picks the CPU package, `tctl`, a drive's `composite`, or a `cpu`
   sensor if there is one, and otherwise the first alphabetically.
 - **Limits:** lm-sensors' `crit`, `max`, `min` and `lcrit` become the upper critical, upper warning, lower warning and
   lower critical limits, so `--list` shows them and `--limits` draws them.
@@ -717,11 +718,11 @@ lmsensors  temperature  nvme-pci-0100-composite         °C    39.85  warn -0.15
   of a host's sensors: ask for it by name, `--list lmsensors`.
 
 ```
-$ python3 ragdoll.py --source lmsensors --get
+$ python3 ocicat.py --source lmsensors --get
 65 °C
-$ python3 ragdoll.py --source lmsensors --get --sensor nvme-pci-0100-composite --field limits
+$ python3 ocicat.py --source lmsensors --get --sensor nvme-pci-0100-composite --field limits
 warn -0.15..81.85 crit -..85.85
-$ python3 ragdoll.py --source lmsensors --tail --poll 60 --output db      # log it every minute
+$ python3 ocicat.py --source lmsensors --tail --poll 60 --output db      # log it every minute
 ```
 
 ### macOS
@@ -732,7 +733,7 @@ install and no root (except for CPU, GPU and ANE power, below). It reads this co
 MacBook Pro (M1 Max); Intel Macs and Macs with no battery or fans are not tested.
 
 ```
-$ python3 ragdoll.py --source lmsensors --list --metric power
+$ python3 ocicat.py --source lmsensors --list --metric power
 SOURCE     METRIC  SENSOR           UNIT    VALUE  LIMITS  KEY
 lmsensors  power   adapter-current  A      0.7866  -       smc/adapter-current
 lmsensors  power   adapter-power    W     15.9962  -       smc/adapter-power
@@ -751,7 +752,7 @@ lmsensors  power   system-power     W     10.1068  -       smc/system-power
 | `fan` | `fan1`, `fan2`, ... | The SMC. A stopped fan reads 0, which is real: an idle MacBook Pro keeps its fans off, and they reached 2,100 RPM under a full load |
 | `power` | `system-power`, `adapter-power`, `adapter-current` | The SMC (live) |
 | | `battery-power`, `battery-current` | `ioreg` (`AppleSmartBattery`); negative while the battery discharges |
-| | `cpu-power`, `gpu-power`, `ane-power`, `package-power` | `powermetrics`, which needs root: ragdoll runs it with `sudo -n`, which never asks for a password, and leaves these out if sudo refuses. It adds about half a second to a read |
+| | `cpu-power`, `gpu-power`, `ane-power`, `package-power` | `powermetrics`, which needs root: ocicat runs it with `sudo -n`, which never asks for a password, and leaves these out if sudo refuses. It adds about half a second to a read |
 | `voltage` | `adapter-voltage`, `battery-voltage` | The SMC and `ioreg` |
 
 - **Sensor names:** a sensor that macOS exposes at several places gets `-1`, `-2` ... in order of its location id, which is
@@ -759,28 +760,28 @@ lmsensors  power   system-power     W     10.1068  -       smc/system-power
   `--list` to see yours. `fan`, `power` and `voltage` need no `--sensor` either: the defaults are `pmu-tdie0`,
   `system-power` and `battery-voltage`.
 - **Only the live values are used.** `ioreg` also reports `SystemLoad` and the adapter's power, but the system refreshes those
-  about once a minute, so ragdoll takes them from the SMC instead.
+  about once a minute, so ocicat takes them from the SMC instead.
 - **Not available:** thermal pressure (`powermetrics --samplers thermal` reports it as Nominal, Moderate, Heavy ...) is not a
   number, so it is not a sensor. There are no limits, because macOS does not publish any.
 
 ### Another computer, over ssh
 
-Give `--host` (and `--user`, if the login name is not yours) and ragdoll runs `sensors -j` on that computer over ssh.
+Give `--host` (and `--user`, if the login name is not yours) and ocicat runs `sensors -j` on that computer over ssh.
 The readings, the cache and the database are then named after that host.
 
 ```
-python3 ragdoll.py --source lmsensors --host 192.0.2.30 --user <user> --list
-python3 ragdoll.py --source lmsensors --host 192.0.2.30 --user <user> --get
-python3 ragdoll.py --source lmsensors --host 192.0.2.30 --user <user> --tail --poll 60 --output db
+python3 ocicat.py --source lmsensors --host 192.0.2.30 --user <user> --list
+python3 ocicat.py --source lmsensors --host 192.0.2.30 --user <user> --get
+python3 ocicat.py --source lmsensors --host 192.0.2.30 --user <user> --tail --poll 60 --output db
 ```
 
-- **How it connects:** ragdoll uses the `paramiko` ssh module and keeps one connection open for the whole run, so a
+- **How it connects:** ocicat uses the `paramiko` ssh module and keeps one connection open for the whole run, so a
   `--tail` or a listing of every metric does not log in again for each read (about a second per poll with the `ssh`
   command, a fraction of that now).
 - **Login:** your keys and the ssh agent are used, and never a password. `--pass` is rejected, and if no key is accepted
   you get a message saying so with a hint to check `ssh <user>@<host>` by hand.
 - **Host keys are checked strictly** against `~/.ssh/known_hosts`. A host that is not there is refused, not accepted
-  automatically: ssh to it once yourself and check the key. A key that has changed is refused with a warning. ragdoll
+  automatically: ssh to it once yourself and check the key. A key that has changed is refused with a warning. ocicat
   never writes to `known_hosts`.
 - **`~/.ssh/config` is read** for the host's `HostName`, `User`, `Port`, `IdentityFile` and `ProxyCommand`, so an alias
   such as `--host labbox` works. `--user` overrides the `User` in the config.
@@ -803,16 +804,17 @@ Windows) through the `keyring` module, so they never appear on the command line 
 
 ```
 # log in once and save; credentials are only saved if the login succeeds
-python3 ragdoll.py --host 192.0.2.10 --user <user> --pass <password> --save-credentials --list
+python3 ocicat.py --host 192.0.2.10 --user <user> --pass <password> --save-credentials --list
 
 # afterwards no credentials are needed
-python3 ragdoll.py --host 192.0.2.10 --last week --chart line
+python3 ocicat.py --host 192.0.2.10 --last week --chart line
 
 # remove them again
-python3 ragdoll.py --host 192.0.2.10 --forget-credentials
+python3 ocicat.py --host 192.0.2.10 --forget-credentials
 ```
 
-- Entries are stored per host, under the service name `ragdoll:<host>`. The web and redfish sources use the same
+- Entries are stored per host, under the service name `ocicat:<host>` (credentials saved before 0.5.3, when the tool was
+  called ragdoll, are under `ragdoll:<host>`; they are still found, and `--forget-credentials` removes both). The web and redfish sources use the same
   user name and password. `--save-credentials` saves for `--source`, or
   for the source named after `--list`, otherwise for `web`.
 - On a machine without a keyring (a headless server or a cron job), use the `IDRAC_USER`, `IDRAC_PASS` and
@@ -825,19 +827,19 @@ python3 ragdoll.py --host 192.0.2.10 --forget-credentials
 
 ## Running regularly
 
-SNMP gives only the current value, so history builds up as readings are collected. Run ragdoll periodically with
+SNMP gives only the current value, so history builds up as readings are collected. Run ocicat periodically with
 `--raw`, which takes a reading without drawing a chart, for example from cron every 10 minutes (one entry per sensor
 you care about, since each metric and sensor has its own cache file):
 
 ```
-*/10 * * * * python3 /path/to/ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --raw >/dev/null
+*/10 * * * * python3 /path/to/ocicat.py --host 192.0.2.20 --source snmp --sensor cpu1 --raw >/dev/null
 ```
 
 Add `--db` to keep the readings in a SQLite database as well. Once there are enough readings, a chart shows how the
 sensor changed:
 
 ```
-python3 ragdoll.py --host 192.0.2.20 --source snmp --sensor cpu1 --chart line --last day
+python3 ocicat.py --host 192.0.2.20 --source snmp --sensor cpu1 --chart line --last day
 ```
 
 The first run shows a single point. To keep a process running instead of using cron, see [Polling with --tail](#polling-with---tail). For a quick look at the latest readings as bars, use `--last 12 --chart
@@ -845,7 +847,7 @@ horizontal`; for just the current value, use [`--get`](#getting-a-current-value)
 
 ## Polling with --tail
 
-`--tail` keeps ragdoll running and polls the source for a sensor, like `tail -f`, until you press Ctrl-C. `--poll`
+`--tail` keeps ocicat running and polls the source for a sensor, like `tail -f`, until you press Ctrl-C. `--poll`
 sets the seconds between polls (at least 1; the default is 30, about how often an iDRAC refreshes its sensors, so
 polling faster only repeats values). Giving `--poll` starts `--tail` too. It defaults to `--source snmp`, and
 `--metric` and `--sensor` choose the sensor, as elsewhere.
@@ -861,7 +863,7 @@ polling faster only repeats values). Giving `--poll` starts `--tail` too. It def
 | `db` (or `database`) | stores the reading in the SQLite database and prints nothing |
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --tail --poll 2 --metric fan --sensor fan4b
+$ python3 ocicat.py --host 192.0.2.20 --tail --poll 2 --metric fan --sensor fan4b
 2026-10-06 18:03:58  2880 RPM
 2026-10-06 18:04:00  2880 RPM
 2026-10-06 18:04:03  2880 RPM
@@ -871,10 +873,10 @@ Stopped after 3 polls.
 
 ```
 # log the inlet temperature every minute to the default database, quietly
-python3 ragdoll.py --host 192.0.2.20 --tail --poll 60 --output db
+python3 ocicat.py --host 192.0.2.20 --tail --poll 60 --output db
 ```
 
-- **The database:** `--output db` uses `--db PATH`, or the default database (`~/.local/share/ragdoll/ragdoll.db`) if
+- **The database:** `--output db` uses `--db PATH`, or the default database (`~/.local/share/ocicat/ocicat.db`) if
   `--db` is not given. Each reading goes in as it is polled, in the same table as everything else (see
   [SQLite database](#sqlite-database)), so charts and `--no-fetch` can use it. `--db` with `--output text` shows each
   reading and stores it too.
@@ -934,7 +936,7 @@ zone (AEDT here), which is named in each title.
 ### Line chart
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --source gui --last day --chart line --height 16
+$ python3 ocicat.py --host 192.0.2.20 --source gui --last day --chart line --height 16
                192.0.2.20 Inlet Temperature (Average / Peak) [AEDT]
      ┌─────────────────────────────────────────────────────────────────────────┐
 18.00┤ ▞▞ Average                                                              │
@@ -955,7 +957,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --source gui --last day --chart line --he
 ### Bar charts
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 12 --chart vertical --height 14
+$ python3 ocicat.py --host 192.0.2.20 --source gui --last 12 --chart vertical --height 14
                192.0.2.20 Inlet Temperature (Average / Peak) [AEDT]
     ┌──────────────────────────────────────────────────────────────────────────┐
 17.0┤ ██ Average ███████████████████   ███   ███                               │
@@ -974,7 +976,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --source gui --last 12 --chart vertical -
 termgraph's `horizontal` bars show the timestamp and value on each line:
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 4 --chart horizontal --module termgraph
+$ python3 ocicat.py --host 192.0.2.20 --source gui --last 4 --chart horizontal --module termgraph
 # 192.0.2.20 Inlet Temperature (Average / Peak) [AEDT]
 
 ▇ Average ▇ Peak
@@ -992,7 +994,7 @@ Oct_06_06:00:31: ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇
 ### Table
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 5 --output table
+$ python3 ocicat.py --host 192.0.2.20 --source gui --last 5 --output table
 192.0.2.20 Inlet Temperature (Average / Peak) [AEDT]
 +---------------------+--------------+-----------+
 | Time (AEDT)         | Average (°C) | Peak (°C) |
@@ -1008,7 +1010,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --source gui --last 5 --output table
 SNMP gives the current value only, so Average and Peak are the same, and `--tz` changes the zone shown:
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --source snmp --metric fan --sensor fan1a --last 3 --output table --tz UTC
+$ python3 ocicat.py --host 192.0.2.20 --source snmp --metric fan --sensor fan1a --last 3 --output table --tz UTC
 192.0.2.20 Fan1A Speed (Average / Peak) [UTC]
 +---------------------+---------------+------------+
 | Time (UTC)          | Average (RPM) | Peak (RPM) |
@@ -1021,19 +1023,19 @@ $ python3 ragdoll.py --host 192.0.2.20 --source snmp --metric fan --sensor fan1a
 ### CSV
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 3 --output csv
+$ python3 ocicat.py --host 192.0.2.20 --source gui --last 3 --output csv
 time,host,source,metric,sensor,average,peak,unit
 2026-10-06T04:00:31+11:00,192.0.2.20,web,temperature,inlet,14,14,°C
 2026-10-06T05:00:31+11:00,192.0.2.20,web,temperature,inlet,14,14,°C
 2026-10-06T06:00:31+11:00,192.0.2.20,web,temperature,inlet,14,14,°C
 
-$ python3 ragdoll.py --host 192.0.2.20 --source gui --last 3 --output raw
+$ python3 ocicat.py --host 192.0.2.20 --source gui --last 3 --output raw
 Average,Peak,Time
 14,14,2026-10-05T17:00:31Z
 14,14,2026-10-05T18:00:31Z
 14,14,2026-10-05T19:00:31Z
 
-$ python3 ragdoll.py --host 192.0.2.20 --raw | head -4
+$ python3 ocicat.py --host 192.0.2.20 --raw | head -4
 Average,Peak,Time
 22,23,2016-10-14T15:59:16Z
 20,21,2016-10-17T13:59:19Z
@@ -1045,7 +1047,7 @@ The last command is the older `--raw` flag, which prints every stored reading; o
 ### Sensor listing as a table
 
 ```
-$ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
+$ python3 ocicat.py --host 192.0.2.20 --list temperature --output table
 +--------+-------------+---------+------+-------+------------------------+------------------------------------------+
 | SOURCE | METRIC      | SENSOR  | UNIT | VALUE | LIMITS                 | KEY                                      |
 +--------+-------------+---------+------+-------+------------------------+------------------------------------------+
@@ -1063,7 +1065,7 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
   history). These rows are skipped everywhere: they are not charted, printed, cached or stored, and a database written
   by an earlier version that holds them is cleaned the next time `--db` stores readings: the rows are deleted and the
   file is compacted, which frees the space they used.
-- The iDRAC reports temperatures and power supply currents in tenths, and voltages in millivolts; ragdoll converts
+- The iDRAC reports temperatures and power supply currents in tenths, and voltages in millivolts; ocicat converts
   them, so values are always in the units shown (°C, RPM, W, A, Wh, V, B/s or a status code).
 - The "Average" and "Peak" series are identical for SNMP, since each reading is a single value.
 - The web history can lag well behind real time. On one iDRAC the newest sample stayed the same for about 12 hours and
@@ -1073,13 +1075,13 @@ $ python3 ragdoll.py --host 192.0.2.20 --list temperature --output table
   those it draws a full-width bar and shows the value in the label. plotext has no such limitation.
 - The iDRAC web interface ignores unknown sensor names and returns inlet data, which is why sensor names are checked
   against the list first.
-- Sources are registered in the `SOURCES` table in `ragdoll.py`, and outputs in `OUTPUTS`; adding a source (for
+- Sources are registered in the `SOURCES` table in `ocicat.py`, and outputs in `OUTPUTS`; adding a source (for
   example Redfish) means providing a `list` and a `fetch` function. See `CLAUDE.md` and `TODO.md` for the design notes
   and planned work.
 
 ## Version
 
-Current version: **0.5.2**. Print it with `python3 ragdoll.py --version`.
+Current version: **0.5.2**. Print it with `python3 ocicat.py --version`.
 
 Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
