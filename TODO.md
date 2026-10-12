@@ -95,7 +95,7 @@ threshold, 11 upper non-critical, 12 lower non-critical, 13 lower critical.
     (`ready` is 2, `charging` 6).
   Store the code over time so state changes can be charted or alerted on, and decide how to name the sensors.
 - [x] **`network` metric.** Confirmed in IF-MIB: `1.3.6.1.2.1.31.1.1.1.6` is `ifHCInOctets` and `.10` is
-  `ifHCOutOctets`, both 64-bit counters. The iDRAC's own interface is index 6 (`bond0`). Counters only grow, so ragdoll
+  `ifHCOutOctets`, both 64-bit counters. The iDRAC's own interface is index 6 (`bond0`). Counters only grow, so ocicat
   must store the difference between polls and divide by the time between them to chart a rate, and cope with a counter
   reset or wrap. This is management-port traffic only, not the server's own network ports.
 - [x] **Energy and peak power.** Table `4.600.60` (`powerUsageTable`), row 1. My first reading of these columns was
@@ -115,7 +115,7 @@ threshold, 11 upper non-critical, 12 lower non-critical, 13 lower critical.
   output (column 6, `7500` in tenths of a watt = 750 W) and rated input (column 14, `9000` = 900 W).
 - [ ] **Choose amperage units from the probe type, not the name.** The MIB defines the unit by `amperageProbeType`
   (column 7): types 23 (`PowerSupplyAmps`) and 25 (`SystemAmps`) are tenths of an amp, 24 (`PowerSupplyWatts`) and 26
-  (`SystemWatts`) are watts, and any other type is milliamps. ragdoll currently picks the unit from the sensor name
+  (`SystemWatts`) are watts, and any other type is milliamps. ocicat currently picks the unit from the sensor name
   (names ending in `-current` are amps). That is correct on this iDRAC, where the probes are types 23 and 26, but it
   could be wrong on other hardware.
 - [ ] **System event log.** Table `4.300.40` is `eventLogTable`, the iDRAC's event log, with a text record per event
@@ -206,7 +206,7 @@ offered on 2026-10-06:
 - There is no Python module that wraps racadm. The PyPI package `racadm` (0.0.1, "A Python package for racadm CLI") is an
   empty placeholder: its wheel holds only metadata and no code. Other likely names (`pyracadm`, `python-racadm`, `py-racadm`,
   `dracclient`, `dell-racadm`) do not exist.
-- The ssh route that ragdoll already uses needs no racadm on this computer, so a module is not needed for that.
+- The ssh route that ocicat already uses needs no racadm on this computer, so a module is not needed for that.
 - `python-dracclient` 8.0.0 (OpenStack, Apache-2, needs `lxml`, `requests`, `pbr`) talks WS-Man over HTTPS to the iDRAC and has
   `list_cpus`, `list_memory`, `list_nics`, `list_physical_disks`, `list_virtual_disks`, `list_raid_controllers`, `get_system`
   and `list_bios_settings`. It would be a third way to read the inventory for an iDRAC with ssh turned off, but it is a
