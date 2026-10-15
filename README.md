@@ -9,14 +9,40 @@ CSV, or an Excel spreadsheet. It currently reads temperatures, fan speeds, power
 management-network traffic, through the iDRAC's web interface, SNMP or Redfish. It can also read the computer it
 is running on, through lm-sensors.
 
+- [Capabilities](#capabilities) at a glance
 - [Install](#install) and [quick start](#quick-start)
 - [Sources and metrics](#sources-and-metrics): what can be read, and the SNMP-only extras
 - [Listing sensors](#listing-sensors) and [getting a current value](#getting-a-current-value)
+- [Enabling and disabling functions](#enabling-and-disabling-functions) on the iDRAC
+- [Adding a user](#adding-a-user) to the iDRAC
 - [Charts](#charts) and [other outputs](#other-outputs): table, CSV, spreadsheets
 - [Time zones](#time-zones)
 - [Storage](#storage): cache, SQLite database, offline use
 - [This computer's sensors](#this-computers-sensors-lm-sensors), [credentials](#credentials), [running regularly](#running-regularly) and [polling](#polling-with---tail)
 - [Option reference](#option-reference), [example output](#example-output) and [notes](#notes)
+
+## Capabilities
+
+- **Sources** (`--source`): `web` (hourly temperature history from the iDRAC web interface, the default), `snmp`
+  (temperature, fan, power, voltage, health, network and inventory), `lmsensors` (sensors of a Linux or macOS
+  computer, local or over ssh with `--host`), and the inventory-only `redfish`, `racadm`, `wsman` and `system`.
+- **Metrics**: temperature, fan, power, voltage, health and network. Network counters are shown as per-second rates.
+- **Outputs** (`--output`): `chart` (plotext or termgraph), `table`, `csv`, `json`, `raw`, `xlsx`, `xls` and `db`
+  (SQLite).
+- **Modes**: `--list` (every sensor, or the hardware inventory with `--category`, `--name`, `--detail` and `--field`),
+  `--get` (one live reading, nothing stored), `--tail --poll N` (follow a sensor as text, CSV, JSON Lines, raw or db),
+  and `--last` to trim to a recent period.
+- **Storage**: a CSV cache per host, source, metric and sensor (`~/.cache/ocicat`, `--max-age`, `--no-fetch` for
+  offline use), and an optional SQLite database (`--db`) with idempotent inserts. Sensor limits can be drawn on
+  plotext line and scatter charts with `--limits`.
+- **Time**: stored as UTC and shown in local time (`--tz ZONE`, `--utc`). The iDRAC's clock offset is measured, or set
+  with `--tz-offset`. "No reading" samples (`-128`) are dropped.
+- **Credentials**: command line, then environment (`IDRAC_USER`, `IDRAC_PASS`, `IDRAC_COMMUNITY`), then the OS keyring
+  (`--save-credentials`, `--forget-credentials`), then a prompt.
+- **Safety**: ssh host keys are checked strictly and never added; racadm and WS-Man runs are serialised per host so
+  an iDRAC account is not locked out; missing Python modules are installed automatically unless `--no-install`.
+- **Rust port**: a work-in-progress port in `rust/` covers the cache, database, local lmsensors and the table, csv, json
+  and raw outputs; the web, snmp and inventory sources are not yet ported (see `rust/README.md`).
 
 ## Install
 
@@ -399,6 +425,101 @@ $ python3 ocicat.py --host 192.0.2.20 --get inventory --category disk --detail f
 joined as `attribute=value`, while `csv`, `xlsx` and `xls` are tidy, one row per attribute (`category`, `name`,
 `attribute`, `value`), which suits filtering and pivot tables. A spreadsheet is named `<host>_inventory.xlsx` (or
 `.xls`) unless `--file` is given.
+
+## Enabling and disabling functions
+
+Some sources need a service that an iDRAC may have switched off. `--enable` switches them on:
+
+```
+# which functions are on?
+python3 ocicat.py --host 192.0.2.20 --user <user> --pass <password> --enable list
+
+# turn on the SNMP agent, then read it
+python3 ocicat.py --host 192.0.2.20 --user <user> --pass <password> --enable snmp
+```
+
+| Name | What it enables | racadm object |
+|---|---|---|
+| `snmp` | the SNMP agent, for `--source snmp` | `iDRAC.SNMP.AgentEnable` |
+| `redfish` | the Redfish service | `iDRAC.Redfish.Enable` |
+| `ssh` | the ssh service, for `--source racadm` | `iDRAC.SSH.Enable` |
+| `web` (also `wsman`) | the web server, which serves the web interface and WS-Man | `iDRAC.WebServer.Enable` |
+| `ipmi` | IPMI over LAN | `iDRAC.IPMILan.Enable` |
+
+### SNMP versions
+
+`--version 1`, `--version 2` (or `2c`) and `--version 3` choose the SNMP version, for reading as well as for `--enable`
+(the default is 2c; a bare `--version` still prints ocicat's version):
+
+```
+# read over SNMP v3, as an iDRAC user (the user's password is the key)
+python3 ocicat.py --host 192.0.2.20 --source snmp --version 3 --user <user> --pass <password> --get
+
+# the same with MD5 authentication and no privacy
+python3 ocicat.py --host 192.0.2.20 --source snmp --version 3 --user <user> --pass <password> --snmp-auth md5 --snmp-priv none --get
+
+# enable SNMP and allow v3 only for that user (this stops the iDRAC answering v1 and v2c)
+python3 ocicat.py --host 192.0.2.20 --user <user> --pass <password> --enable snmp --version 3
+```
+
+- v1 and v2c use the community (`--community`). v3 uses the iDRAC user, so `--user`/`--pass` replace the community.
+- `--snmp-auth md5|sha|sha256|sha384|sha512` and `--snmp-priv none|des|aes|aes192|aes256` apply to v3 only. Reading
+  defaults to `sha` and `aes`.
+- With `--enable snmp --version 3` and no `--snmp-auth` or `--snmp-priv`, ocicat sets the strongest type the iDRAC
+  accepts: it tries `sha512`, `sha384`, `sha256`, `sha`, `md5` (and `aes256`, `aes192`, `aes`, `des` for privacy, never
+  `none`) and keeps the first one the iDRAC takes. It then prints the flags to read with, such as
+  `--snmp-auth sha256 --snmp-priv aes`, and reading must use them, since the default is `sha` and `aes`. Older iDRACs offer
+  fewer types (an iDRAC8 probably only `sha`/`md5` and `aes`/`des`).
+- With `--enable snmp`, versions 1 and 2 set the iDRAC's SNMP protocol to `All`, since the iDRAC cannot serve only one of
+  them. Version 3 sets it to `SNMPv3`, so v1 and v2c readers stop working, and also switches on SNMPv3 for `--user` with
+  the `--snmp-auth` and `--snmp-priv` protocols. Every change is listed and confirmed first.
+
+Names can be repeated or comma-separated (`--enable snmp,ssh`), and `all` means every one. Functions that are already on
+are left alone. ocicat shows what it will change and asks first; `--yes` skips the question (needed when there is no
+terminal, as in cron). It uses Redfish when it can and racadm over ssh otherwise. A refused login is never retried over
+the other route, because an iDRAC can lock an account out after failed logins. It uses the web credentials, and it cannot
+be combined with `--list`, `--get`, `--tail`, `--raw`, `--no-fetch` or the credential options.
+
+`--disable` switches functions off by the same route, and each one has to be named (`--disable snmp,ipmi`): it refuses
+`all` and `list`. It shows the changes and asks first, and warns when you turn off `web`, `redfish` or `ssh`, which are
+the ways ocicat and other tools reach the iDRAC (turning the one you are using off may leave you needing the console).
+`--disable snmp` alone turns the agent off; with `--version 1` or `2` it leaves the agent on and makes it SNMPv3 only; and
+with `--version 3` it switches SNMPv3 off for `--user`. `--enable` and `--disable` cannot be used together.
+
+```
+python3 ocicat.py --host 192.0.2.20 --user <user> --pass <password> --disable ipmi
+python3 ocicat.py --host 192.0.2.20 --user <user> --pass <password> --disable snmp --version 1   # SNMPv3 only
+```
+
+## Adding a user
+
+`--add user` creates an iDRAC account. `--user` and `--pass` are still the login ocicat uses to do it (it needs the
+Configure Users privilege), so the new account is given with `--new-user`, `--new-pass` and `--privs`:
+
+```
+# a read-only account
+python3 ocicat.py --host 192.0.2.20 --user <user> --pass <password> --add user --new-user reader --new-pass <new-password> --privs read
+
+# an administrator account (a password is generated and printed if --new-pass is left out)
+python3 ocicat.py --host 192.0.2.20 --user <user> --pass <password> --add user --new-user admin2 --privs write
+```
+
+| `--privs` | iDRAC role | Privilege |
+|---|---|---|
+| `read` | Read Only | `0x1` (login) |
+| `operator` | Operator | `0x1f3` |
+| `write`, `admin` | Administrator | `0x1ff` |
+| `none` | no access | `0x0` |
+| a number | whatever those bits mean | `0` to `0x1ff` |
+
+There is no default level, so you always choose one. Without `--new-pass`, ocicat tells you it is generating a password
+and prints it before changing anything (16 random characters: upper and lower case letters, digits and one of `-_.+=`,
+so it works over both routes), for example `Generated password for admin2: 1Gaz3u.rP9YGZTag`. It is not stored
+anywhere else, so keep it; with `--yes` it will be in whatever captures the output. The account goes in the first free slot (2 to 16), is enabled, and
+the command refuses a name that already exists. It uses Redfish when it can and racadm over ssh otherwise, as
+`--enable` does, shows what it will do (never the password) and asks first unless `--yes` is given. User names are 1 to
+16 letters, digits, dots, underscores or hyphens. Over racadm a password cannot contain spaces, quotes or backslashes.
+It does not change the account's IPMI-over-LAN privilege or its SNMPv3 settings.
 
 ## Getting a current value
 
@@ -914,6 +1035,9 @@ A systemd service or a terminal multiplexer is a good place to run it. For one r
 | `--user`/`--username`, `--pass`/`--password` | web credentials; with `--source lmsensors --host`, `--user` is the ssh login name and `--pass` is not allowed |
 | `--community` | SNMP v2c community string |
 | `--save-credentials`, `--forget-credentials` | keep or remove this host's credentials in the OS keyring |
+| `--enable FUNCTION`, `--disable FUNCTION`, `--yes` | switch on (`--enable`, which also takes `all` and `list`) or off (`--disable`, by name only) `snmp`, `redfish`, `ssh`, `web` (also `wsman`) or `ipmi` on the iDRAC; asks first unless `--yes`. See [Enabling and disabling functions](#enabling-and-disabling-functions) |
+| `--version [1\|2\|2c\|3]`, `--snmp-auth md5\|sha\|sha256\|sha384\|sha512`, `--snmp-priv none\|des\|aes\|aes192\|aes256` | with a value, the SNMP version (default 2c; v3 logs in as `--user`) and its protocols; with `--enable snmp` also the iDRAC's SNMP protocol. Bare `--version` prints the version |
+| `--add user`, `--new-user NAME`, `--new-pass PASSWORD`, `--privs read\|operator\|write\|admin\|none\|0xNNN` | create an iDRAC account in the first free slot; `--user`/`--pass` remain the login that does it. See [Adding a user](#adding-a-user) |
 | `--secure` | verify the iDRAC's TLS certificate |
 | `--output O` | `chart`, `table`, `raw`, `csv`, `json`, `xlsx`, `xls` or `db`; with `--list` or `--get`, `text`, `table`, `csv`, `json`, `xlsx` or `xls`; with `--tail`, `text`, `csv`, `json`, `raw` or `db` |
 | `--file FILE` | the spreadsheet to write for `xlsx` and `xls` |
@@ -926,7 +1050,7 @@ A systemd service or a terminal multiplexer is a good place to run it. For one r
 | `--tail`, `--poll SECONDS` | keep polling the source every SECONDS (default 30) and send each reading to `--output` (`text`, `csv`, `raw` or `db`) |
 | `--no-fetch` | show what is already stored without contacting the iDRAC |
 | `--raw` | print every stored reading as CSV and exit (the older flag; see [CSV](#csv)) |
-| `--version`, `--help` | version and full option help |
+| `--version` (no value), `--help` | version and full option help |
 
 ## Example output
 
@@ -1081,7 +1205,7 @@ $ python3 ocicat.py --host 192.0.2.20 --list temperature --output table
 
 ## Version
 
-Current version: **0.5.2**. Print it with `python3 ocicat.py --version`.
+Current version: **0.5.9**. Print it with `python3 ocicat.py --version`.
 
 Versions are `MAJOR.MINOR.PATCH` with no number above 9: when one would pass 9 it rolls over into the next, so 0.0.9
 is followed by 0.1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each version.

@@ -8,10 +8,102 @@ Versions are `MAJOR.MINOR.PATCH`, but no number goes above 9: when a number woul
 next one, so 0.0.9 is followed by 0.1.0 and 0.9.9 by 1.0.0. Versions are therefore sequential release numbers
 and do not follow the semantic versioning rules for what each number means.
 
-The project had no version history before this file was written, so versions 0.0.1 to 0.5.3 were assigned
+The project had no version history before this file was written, so versions 0.0.1 to 0.5.9 were assigned
 afterwards, one per step of development, all on 2026-10-06. The script reports its version with `--version`.
 
 ## [Unreleased]
+
+### Changed
+- README: added a Capabilities section summarising sources, metrics, outputs, modes, storage, time, credentials and
+  safety, and corrected the current version to 0.5.3.
+
+## [0.5.9] - 2026-10-15
+
+### Changed
+- `--add user` without `--new-pass` now generates a password instead of asking for one. It says so on stderr
+  ("No --new-pass given: generating a password for NAME.") and prints `Generated password for NAME: ...` on stdout
+  before anything is changed, so the password is not lost if the change fails half way or the user declines. It is 16
+  random characters (from the `secrets` module): at least one upper case letter, lower case letter, digit and one of
+  `-_.+=`, with no spaces, quotes or backslashes, so racadm accepts it too, and within an iDRAC8's 20 characters.
+  Anyone running with `--yes` in a log or cron job should know the password then ends up in that output.
+
+## [0.5.8] - 2026-10-15
+
+### Added
+- `--add user` creates an iDRAC account, from `--new-user NAME`, `--new-pass PASSWORD` (asked for twice on the terminal
+  if missing) and `--privs`. `--user` and `--pass` stay the login that does the work, so the new account has its own
+  flags. `--privs` takes `read` (Read Only, 0x1), `operator` (0x1f3), `write` or `admin` (Administrator, 0x1ff), `none`,
+  or a number from 0 to 0x1ff; it has no default, so the level is always chosen. The account goes in the first free slot
+  (2 to 16) and is enabled. An existing name is refused.
+- It works like `--enable`: Redfish first (a PATCH of `Users.N.UserName`, `Password`, `Privilege` and `Enable`, then a
+  read-back of the name), racadm `set iDRAC.Users.N.*` if Redfish cannot, under `idrac_lock`, a refused login never
+  retried. It lists what it will do (never the password) and asks first unless `--yes` is given. Over racadm a password
+  with spaces, quotes or a backslash is refused.
+- `--add` cannot be combined with `--enable`, `--disable`, `--list`, `--get` and the other options that exclude them, and
+  `--yes` applies to it. IPMI-over-LAN privilege and SNMPv3 settings of the new account are not touched.
+- Not yet run against a real iDRAC: the `Users.N.*` attribute names and the privilege numbers are Dell's documented ones,
+  tested against stand-ins only. Needs a login with the Configure Users privilege.
+
+## [0.5.7] - 2026-10-15
+
+### Changed
+- `--enable snmp --version 3` now uses the strongest authentication and privacy types the iDRAC accepts when
+  `--snmp-auth` or `--snmp-priv` is not given, instead of fixed `SHA` and `AES`. It tries `SHA512`, `SHA384`, `SHA256`,
+  `SHA`, `MD5` and then `AES256`, `AES192`, `AES`, `DES` (never `None`), each as its own change, keeps the first the
+  iDRAC accepts, and prints the flags to read with, for example `--snmp-auth sha256 --snmp-priv aes`. A value the
+  attribute already has stops the search. The confirmation shows "the strongest of ...". A type given explicitly is set as given.
+- `--snmp-auth` takes `md5`, `sha`, `sha256`, `sha384` or `sha512`, and `--snmp-priv` takes `none`, `des`, `aes`, `aes192`
+  or `aes256`, for reading too. Reading still defaults to `sha` and `aes`, so after enabling the strongest, pass the
+  flags that were printed.
+- Not yet run against a real iDRAC: which of these values it accepts, and their exact spelling, are unknown (a rejected
+  one only moves the search down). A run on an account that already has the strongest type still tries the stronger
+  ones first, and asks again.
+
+## [0.5.6] - 2026-10-15
+
+### Added
+- `--disable FUNCTION` switches functions of an iDRAC off, the opposite of `--enable`, by the same route (Redfish first,
+  racadm if Redfish cannot, under `idrac_lock`, a refused login never retried). The names are `snmp`, `redfish`, `ssh`,
+  `web` (also `wsman`) and `ipmi`, and each must be given by name: `all` and `list` are refused, so nothing is switched
+  off by accident (`--enable list` shows the state). It lists the changes and asks first unless `--yes` is given, and
+  warns when you turn off `web`, `redfish` or `ssh`, which are the ways in that ocicat and other tools use.
+- `--disable snmp --version 1|2` leaves the agent on and sets the iDRAC's SNMP protocol to `SNMPv3`, so v1 and v2c
+  stop. `--disable snmp --version 3` switches SNMPv3 off for the `--user` account only. `--disable snmp` alone turns
+  the agent off.
+- `--enable` and `--disable` cannot be used together, and `--yes` applies to both.
+- Not yet run against a real iDRAC (attribute names as for 0.5.4 and 0.5.5); tested against stand-ins only.
+
+## [0.5.5] - 2026-10-15
+
+### Added
+- SNMP versions: `--version 1`, `--version 2` (or `2c`) and `--version 3` choose the SNMP version of the snmp source
+  (default 2c, as before). Bare `--version` still prints ocicat's version. v1 and v2c use `--community`. v3 logs in as
+  the iDRAC user (`--user`/`--pass`, the same credentials as the web source: an iDRAC uses the user's password as both the
+  authentication and the privacy key), with `--snmp-auth sha|md5` (default sha) and `--snmp-priv aes|des|none` (default
+  aes). Saved credentials follow the version: a community for v1/v2c, the user and password for v3.
+- `--enable snmp --version N` also sets the iDRAC's SNMP protocol: `All` for 1 and 2 (the iDRAC cannot serve only one of
+  them) and `SNMPv3` for 3, which makes it stop answering v1 and v2c. For 3 it also switches on SNMPv3 for the `--user`
+  account and sets its authentication and privacy types from `--snmp-auth` and `--snmp-priv`. Each change is listed and
+  confirmed first. `--enable list` shows the protocol. The account slot is found from the user names in Redfish, or by
+  asking racadm slot by slot.
+- Changed: `--enable` writes the value `Enabled` over racadm (it wrote `1`) and prints each attribute it sets.
+- Not yet run against a real iDRAC: the `SNMPProtocol`, `SNMPv3Enable`, `SNMPv3AuthenticationType` and
+  `SNMPv3PrivacyType` names and values, and the SNMPv3 login itself, were checked against stand-ins only.
+
+## [0.5.4] - 2026-10-15
+
+### Added
+- `--enable FUNCTION` switches on functions of an iDRAC: `snmp` (SNMP agent), `redfish`, `ssh`, `web` (web server, also
+  `wsman`, which is served by it), `ipmi` (IPMI over LAN) or `all`; repeat the flag or separate names with commas.
+  `--enable list` only shows which are enabled. It tries Redfish first (a PATCH of the Dell attributes under
+  `/redfish/v1/Managers/iDRAC.Embedded.1/Attributes`) and uses racadm over ssh when Redfish is unreachable or has no
+  attributes resource. A refused Redfish login stops there: the same credentials are never tried over ssh, which could
+  lock the account. Everything runs under `idrac_lock`, with one login per transport. Functions already on are left
+  alone, and it asks before changing anything unless `--yes` is given (without a terminal and without `--yes` it only
+  says what it would do).
+- `--yes`, which only applies to `--enable`.
+- Not yet run against a real iDRAC: the racadm object names and Redfish attribute names are Dell's documented ones, but
+  were only exercised against a stand-in in tests. WS-Man having no switch of its own is also unverified.
 
 ## [0.5.3] - 2026-10-07
 

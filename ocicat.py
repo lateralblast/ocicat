@@ -29,11 +29,13 @@ import os
 import platform
 import plistlib
 import re
+import secrets
 import shlex
 import shutil
 import signal
 import socket
 import sqlite3
+import string
 import struct
 import subprocess
 import sys
@@ -75,7 +77,7 @@ install_missing_modules()
 import requests
 import urllib3
 
-__version__ = "0.5.3"
+__version__ = "0.5.9"
 
 
 class SourceError(Exception):
@@ -444,25 +446,36 @@ def keyring_forget(host):
     return removed
 
 
+def snmp_version(args):
+    """The SNMP version asked for with --version: 1, 2c (the default) or 3."""
+    return getattr(args, "snmp_version", None) or "2c"
+
+
+def credential_fields(args):
+    """The credentials a source logs in with: SNMP v1/v2c a community, SNMP v3 the iDRAC user, the rest user and password."""
+    if args.source == "snmp" and snmp_version(args) != "3":
+        return ("community",)
+    return ("user", "password")
+
+
 def resolve_credentials(args):
     """Fill in missing credentials, in place. Order: command line, environment, keyring, prompt."""
     if SOURCES.get(args.source, {}).get("local"):
         return  # this computer's own sensors need no login
-    fields = ("community",) if args.source == "snmp" else ("user", "password")
+    fields = credential_fields(args)
     for field in fields:
         if getattr(args, field):
             continue
         value = os.environ.get(CREDENTIAL_ENV[field]) or keyring_get(args.host, field)
         setattr(args, field, value)
-    if args.source == "snmp":
+    if fields == ("community",):
         args.community = args.community or DEFAULT_COMMUNITY
     elif args.user and not args.password and sys.stdin.isatty():
         args.password = getpass.getpass(f"Password for {args.user}@{args.host}: ")
 
 
 def save_credentials(args):
-    fields = ("community",) if args.source == "snmp" else ("user", "password")
-    for field in fields:
+    for field in credential_fields(args):
         keyring_set(args.host, field, getattr(args, field))
 
 
@@ -606,7 +619,28 @@ def parse_args():
     paragraphs = __doc__.strip().split("\n\n")
     p = argparse.ArgumentParser(description=". ".join(q.replace("\n", " ") for q in paragraphs[:2]),
                                 epilog=paragraphs[2].replace("\n", " "))
-    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    class VersionAction(argparse.Action):
+        """Bare --version prints ocicat's version; --version 1, 2 or 3 chooses the SNMP version."""
+
+        def __call__(self, parser, namespace, value, option_string=None):
+            if value is None:
+                print(f"{parser.prog} {__version__}")
+                parser.exit()
+            if value.lower() not in SNMP_VERSIONS:
+                parser.error(f"--version takes 1, 2 (or 2c) or 3 as the SNMP version, not {value!r}")
+            namespace.snmp_version = SNMP_VERSIONS[value.lower()]
+
+    p.add_argument("--version", nargs="?", action=VersionAction, metavar="SNMP_VERSION", default=None,
+                   help="with no value, print ocicat's version and exit; with 1, 2 (2c) or 3, the SNMP version to use "
+                        "(default 2c; with --enable or --disable snmp it also sets the iDRAC's SNMP protocol, v3 using --user)")
+    p.add_argument("--snmp-auth", choices=sorted(SNMP_AUTH),
+                   help="SNMP v3 authentication protocol; the key is the iDRAC user's password. Reading defaults to sha. "
+                        "--enable snmp --version 3 uses the strongest the iDRAC accepts (tried from sha512 down) when this "
+                        "is not given, and says which to read with")
+    p.add_argument("--snmp-priv", choices=sorted(SNMP_PRIV),
+                   help="SNMP v3 privacy protocol (none gives authentication only). Reading defaults to aes. "
+                        "--enable snmp --version 3 uses the strongest the iDRAC accepts (tried from aes256 down) when "
+                        "this is not given")
     p.add_argument("--no-install", action="store_true",
                    help="do not install missing Python modules with pip at startup (or set OCICAT_NO_INSTALL=1)")
     p.add_argument("--host", help="iDRAC address, e.g. 192.168.8.98. With --source lmsensors or system it is optional: without it "
@@ -620,6 +654,25 @@ def parse_args():
                    help="after a successful login, save the credentials for this host in the OS keyring")
     p.add_argument("--forget-credentials", action="store_true",
                    help="delete this host's credentials from the OS keyring and exit")
+    p.add_argument("--enable", action="append", metavar="FUNCTION",
+                   help="switch on functions of the iDRAC over Redfish, or racadm if Redfish cannot: snmp, redfish, ssh, "
+                        "web (also wsman), ipmi, or all; repeat or separate with commas. 'list' only shows which are "
+                        "enabled. Asks first unless --yes is given. Functions already on are left alone")
+    p.add_argument("--disable", action="append", metavar="FUNCTION",
+                   help="switch off functions of the iDRAC, named one by one (snmp, redfish, ssh, web or wsman, ipmi; "
+                        "no 'all'), over Redfish or racadm like --enable. With snmp, --version 1 or 2 sets the iDRAC to "
+                        "SNMPv3 only and --version 3 switches SNMPv3 off for --user. Asks first unless --yes is given")
+    p.add_argument("--add", choices=sorted(ADD_FEATURES), metavar="FEATURE",
+                   help="add something to the iDRAC. user creates an account in the first free slot, from --new-user, "
+                        "--new-pass (generated and printed if missing) and --privs; --user and --pass stay the login that does it. "
+                        "Asks first unless --yes is given")
+    p.add_argument("--new-user", metavar="NAME", help="the name of the account --add user creates (1 to 16 letters, digits, . _ -)")
+    p.add_argument("--new-pass", metavar="PASSWORD", help="its password (if not given, one is generated and printed)")
+    p.add_argument("--privs", metavar="PRIVS",
+                   help="the new account's privileges: read (Read Only), operator, write or admin (Administrator), none, "
+                        "or a number such as 0x1ff")
+    p.add_argument("--yes", action="store_true",
+                   help="do not ask for confirmation before --enable, --disable or --add changes anything")
     p.add_argument("--source", choices=sorted(SOURCES), type=lambda v: SOURCE_ALIASES.get(v.lower(), v.lower()),
                    help="where sensor data comes from: web is the iDRAC web interface (history), "
                         "snmp reads the current value and builds history in the cache, lmsensors does the same for this "
@@ -726,6 +779,32 @@ def parse_args():
             args.host = socket.gethostname()
     elif not args.host:
         p.error("the following arguments are required: --host")
+    changing = "--add" if args.add else "--disable" if args.disable else "--enable"
+    if sum(bool(x) for x in (args.enable, args.disable, args.add)) > 1:
+        p.error("--enable, --disable and --add cannot be used together; run them one after the other")
+    if args.add:
+        if not args.new_user or not args.privs:
+            p.error("--add user needs --new-user and --privs")
+        if not ADD_NAME.fullmatch(args.new_user):
+            p.error("--new-user must be 1 to 16 letters, digits, dots, underscores or hyphens")
+        try:
+            add_privilege(args.privs)
+        except ValueError as e:
+            p.error(str(e))
+    elif args.new_user or args.new_pass or args.privs:
+        p.error("--new-user, --new-pass and --privs only apply to --add")
+    if (args.enable or args.disable or args.add) and (args.list or args.get or args.tail or args.raw or args.no_fetch
+                                          or args.save_credentials or args.forget_credentials):
+        p.error(f"{changing} changes the iDRAC and cannot be combined with --list, --get, --tail, --raw, --no-fetch "
+                "or the credential options")
+    if (args.enable or args.disable or args.add) and SOURCES.get(args.source, {}).get("local"):
+        p.error(f"{changing} works on an iDRAC, not on --source {args.source}")
+    if (args.snmp_auth or args.snmp_priv) and getattr(args, "snmp_version", None) != "3":
+        p.error("--snmp-auth and --snmp-priv only apply with --version 3")
+    if getattr(args, "snmp_version", None) and args.source not in (None, "snmp"):
+        p.error(f"--version 1, 2 or 3 is an SNMP version and does not apply to --source {args.source}")
+    if args.yes and not (args.enable or args.disable or args.add):
+        p.error("--yes only applies to --enable, --disable and --add")
     if args.tz and args.utc:
         p.error("--tz and --utc cannot be used together")
     if args.get not in (None, "sensor", "inventory"):
@@ -883,13 +962,45 @@ def snmp_close(args):
         args.snmp_state = None
 
 
+SNMP_VERSIONS = {"1": "1", "2": "2c", "2c": "2c", "3": "3"}
+# SNMP v3 protocols by the name used with --snmp-auth and --snmp-priv, weakest first: the iDRAC's value, the pysnmp name
+SNMP_AUTH = {"md5": ("MD5", "usmHMACMD5AuthProtocol"), "sha": ("SHA", "usmHMACSHAAuthProtocol"),
+             "sha256": ("SHA256", "usmHMAC192SHA256AuthProtocol"), "sha384": ("SHA384", "usmHMAC256SHA384AuthProtocol"),
+             "sha512": ("SHA512", "usmHMAC384SHA512AuthProtocol")}
+SNMP_PRIV = {"none": ("None", "usmNoPrivProtocol"), "des": ("DES", "usmDESPrivProtocol"),
+             "aes": ("AES", "usmAesCfb128Protocol"), "aes192": ("AES192", "usmAesCfb192Protocol"),
+             "aes256": ("AES256", "usmAesCfb256Protocol")}
+
+
+def snmp_auth_data(args):
+    """The pysnmp authentication object for --version: a community for v1 and v2c, the iDRAC user for v3.
+
+    SNMPv3 on an iDRAC uses the iDRAC user's own password as both the authentication and the privacy key, so the web
+    credentials serve (--snmp-auth and --snmp-priv choose the protocols the user is set to; priv none skips privacy).
+    """
+    import pysnmp.hlapi.v3arch.asyncio as hlapi
+    from pysnmp.hlapi.v3arch.asyncio import CommunityData, UsmUserData
+    version = snmp_version(args)
+    if version != "3":
+        return CommunityData(args.community, mpModel=0 if version == "1" else 1)
+    if not args.user or not args.password:
+        raise SourceError("SNMP v3 needs the iDRAC user's credentials: --user/--pass, $IDRAC_USER/$IDRAC_PASS, "
+                          "or ones saved with --save-credentials")
+    auth = getattr(hlapi, SNMP_AUTH[args.snmp_auth or "sha"][1])
+    priv_name = args.snmp_priv or "aes"
+    priv = getattr(hlapi, SNMP_PRIV[priv_name][1])
+    if priv_name == "none":
+        return UsmUserData(args.user, authKey=args.password, authProtocol=auth, privProtocol=priv)
+    return UsmUserData(args.user, authKey=args.password, privKey=args.password, authProtocol=auth, privProtocol=priv)
+
+
 async def snmp_walk(args, oid):
     """Return {sub-identifiers after oid, for example '1.3': value} for every value under oid."""
-    from pysnmp.hlapi.v3arch.asyncio import CommunityData, ContextData, ObjectIdentity, ObjectType, walk_cmd
+    from pysnmp.hlapi.v3arch.asyncio import ContextData, ObjectIdentity, ObjectType, walk_cmd
     engine, target = await snmp_connection(args)
     out = {}
     async for err, status, _, binds in walk_cmd(
-            engine, CommunityData(args.community, mpModel=1), target, ContextData(),
+            engine, snmp_auth_data(args), target, ContextData(),
             ObjectType(ObjectIdentity(oid)), lexicographicMode=False):
         if err or status:
             raise SourceError(f"SNMP error from {args.host}: {err or status.prettyPrint()}")
@@ -1052,6 +1163,10 @@ def lm_ssh_command(args, command="sensors -j"):
     target = f"{args.user}@{args.host}" if args.user else args.host
     # `--` keeps a host from being read as an ssh option
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR", "--", target, command]
+
+
+class LoginRefused(SourceError):
+    """The iDRAC refused the credentials: never retry that over another transport, it can lock the account out."""
 
 
 class SshUnreachable(SourceError):
@@ -2022,7 +2137,7 @@ def redfish_session(args):
         raise SourceError(f"could not log in to Redfish: {e}")
     token, location = reply.headers.get("X-Auth-Token"), reply.headers.get("Location")
     if not token:
-        raise SourceError("Redfish login failed (check --user/--pass)")
+        raise LoginRefused("Redfish login failed (check --user/--pass)")
     session.headers["X-Auth-Token"] = token
 
     def get(path):
@@ -2034,6 +2149,15 @@ def redfish_session(args):
             raise SourceError(f"Redfish request for {path} returned {resp.status_code}")
         return resp.json()
 
+    def patch(path, body):
+        try:
+            resp = session.patch(base + path, json=body, timeout=60)
+        except requests.RequestException as e:
+            raise SourceError(f"Redfish change to {path} failed: {e}")
+        if resp.status_code not in (200, 202, 204):
+            raise SourceError(f"Redfish change to {path} returned {resp.status_code}: {resp.text.strip()[:200]}")
+
+    get.patch = patch
     try:
         yield get
     finally:
@@ -2395,6 +2519,376 @@ class _WsmanRequests:
 
     def __getattr__(self, name):  # requests.auth, requests.exceptions ...
         return getattr(requests, name)
+
+
+ENABLE_ATTRIBUTES = "/redfish/v1/Managers/iDRAC.Embedded.1/Attributes"
+# name: (what it is, racadm object, Redfish attribute). WS-Man has no switch of its own: it is served by the web server.
+ENABLE_FUNCTIONS = {
+    "snmp": ("SNMP agent", "iDRAC.SNMP.AgentEnable", "SNMP.1.AgentEnable"),
+    "redfish": ("Redfish service", "iDRAC.Redfish.Enable", "Redfish.1.Enable"),
+    "ssh": ("ssh service (racadm over ssh)", "iDRAC.SSH.Enable", "SSH.1.Enable"),
+    "web": ("web server (web interface and WS-Man)", "iDRAC.WebServer.Enable", "WebServer.1.Enable"),
+    "ipmi": ("IPMI over LAN", "iDRAC.IPMILan.Enable", "IPMILan.1.Enable"),
+}
+ENABLE_ALIASES = {"wsman": "web", "gui": "web", "webserver": "web", "ipmilan": "ipmi"}
+
+
+def enable_names(values, disabling=False):
+    """Turn the --enable or --disable values (repeatable, comma-separated, aliases allowed) into function names.
+
+    --enable also takes 'list' and 'all'; --disable takes neither, so that nothing is switched off by accident.
+    """
+    names = []
+    for value in values:
+        for name in value.lower().split(","):
+            name = ENABLE_ALIASES.get(name.strip(), name.strip())
+            if disabling and name in ("all", "list"):
+                raise SourceError(f"--disable needs the functions named one by one, not {name!r}"
+                                  + ("; use --enable list to see their state" if name == "list" else ""))
+            if name == "all":
+                names.extend(ENABLE_FUNCTIONS)
+            elif name == "list" or name in ENABLE_FUNCTIONS:
+                names.append(name)
+            elif name:
+                raise SourceError(f"cannot {'disable' if disabling else 'enable'} {name!r}; choose from: "
+                                  f"{'' if disabling else 'list, all, '}{', '.join(ENABLE_FUNCTIONS)} "
+                                  f"(wsman is the same as web)")
+    return list(dict.fromkeys(names))
+
+
+def enable_state(value):
+    return str(value).strip().lower() in ("enabled", "1", "true")
+
+
+# what the SNMP version means on the iDRAC: v1 and v2c are served by the "All" protocol setting, v3 alone by "SNMPv3"
+SNMP_PROTOCOL = ("iDRAC.SNMP.SNMPProtocol", "SNMP.1.SNMPProtocol")
+SNMP_USER_ATTRIBUTES = (("SNMPv3Enable", "Enabled"), ("SNMPv3AuthenticationType", None), ("SNMPv3PrivacyType", None))
+
+
+def enable_wanted(args, names, listing, user_index=None):
+    """The attribute changes --enable or --disable asks for, as (label, Redfish key, racadm object, wanted value or None).
+
+    A wanted value can also be a list of values to try in order, strongest first (apply_enable keeps the first accepted).
+
+    A function is wanted "Enabled" (or "Disabled" with --disable); None just reads it. With snmp and --version the iDRAC's
+    SNMP protocol follows the version. Enabling v3 also gets the chosen user's SNMPv3 switched on with the --snmp-auth
+    and --snmp-priv protocols, or the strongest the iDRAC accepts if not given (the iDRAC takes the user's password as the
+    key, so none is set here). Disabling a version
+    leaves the agent on: v1 or v2 sets the protocol to SNMPv3 (so v1 and v2c stop), v3 switches SNMPv3 off for that user.
+    `user_index` is the iDRAC account slot of --user, found by the caller.
+    """
+    value = getattr(args, "change", "Enabled")
+    version = snmp_version(args) if getattr(args, "snmp_version", None) else None
+    wanted = [(ENABLE_FUNCTIONS[n][0], ENABLE_FUNCTIONS[n][2], ENABLE_FUNCTIONS[n][1], None if listing else value)
+              for n in names if not (n == "snmp" and version and value == "Disabled")]
+    if "snmp" not in names:
+        return wanted
+    protocol = None
+    if not listing and version:
+        protocol = "SNMPv3" if version == "3" or value == "Disabled" else "All"
+    if value == "Disabled" and version == "3":
+        protocol = None  # only this user stops using v3; the protocol setting is left as it is
+    wanted.append(("SNMP protocol", SNMP_PROTOCOL[1], SNMP_PROTOCOL[0], protocol))
+    if version == "3" and not listing:
+        if user_index is None:
+            raise SourceError(f"SNMP v3 needs an iDRAC user, and no account named {args.user!r} was found")
+        # a type not given means the strongest the iDRAC accepts: a list of values to try, strongest first
+        auth = SNMP_AUTH[args.snmp_auth][0] if args.snmp_auth else [SNMP_AUTH[n][0] for n in reversed(SNMP_AUTH)]
+        priv = SNMP_PRIV[args.snmp_priv][0] if args.snmp_priv else [SNMP_PRIV[n][0] for n in reversed(SNMP_PRIV)
+                                                                    if n != "none"]
+        settings = (("SNMPv3Enable", value),)
+        if value == "Enabled":
+            settings += (("SNMPv3AuthenticationType", auth), ("SNMPv3PrivacyType", priv))
+        for attribute, wanted_value in settings:
+            wanted.append((f"SNMPv3 {attribute[6:]} for {args.user}", f"Users.{user_index}.{attribute}",
+                           f"iDRAC.Users.{user_index}.{attribute}", wanted_value))
+    return wanted
+
+
+def enable_user_index(args, names, attributes=None):
+    """The iDRAC account slot (1-16) whose user name is --user, for SNMP v3; None when not needed or not found."""
+    if "snmp" not in names or snmp_version(args) != "3" or not getattr(args, "snmp_version", None):
+        return None
+    if attributes is not None:
+        for key, value in attributes.items():
+            found = re.fullmatch(r"Users\.(\d+)\.UserName", key)
+            if found and value == args.user:
+                return int(found.group(1))
+        return None
+    for index in range(2, 17):  # slot 1 is the anonymous user
+        text = racadm_run(args, f"get iDRAC.Users.{index}.UserName")
+        found = re.search(r"^\s*UserName\s*=\s*(.*)$", text, re.M)
+        if found and found.group(1).strip() == args.user:
+            return index
+    return None
+
+
+def enable_functions(args):
+    """Show (--enable list), switch on (--enable) or switch off (--disable) iDRAC functions; returns an exit status.
+
+    Redfish is tried first, then racadm.
+    Everything runs under idrac_lock with one login per transport. A refused login is final (LoginRefused): trying the
+    same credentials over ssh could lock the account. Redfish is skipped for the change when it is unreachable or has no
+    attributes resource (iDRAC8 firmware that lacks it), and racadm does what it could not.
+    """
+    try:
+        names = enable_names(args.disable or args.enable, disabling=bool(args.disable))
+    except SourceError as e:
+        print(e, file=sys.stderr)
+        return 2
+    args = copy.copy(args)
+    args.source = "racadm"  # the web, redfish and racadm sources share the user name and password
+    args.change = "Disabled" if args.disable else "Enabled"
+    listing = "list" in names or not names
+    names = [n for n in names if n != "list"] or list(ENABLE_FUNCTIONS)
+    if getattr(args, "snmp_version", None) and "snmp" not in names:
+        print("--version only applies to --enable snmp or --disable snmp", file=sys.stderr)
+        return 2
+    state, rf_index = {}, None  # Redfish key -> current value, and the Redfish-found slot of --user
+    try:
+        with idrac_lock(args):
+            try:
+                with redfish_session(args) as get:
+                    try:
+                        attributes = get(ENABLE_ATTRIBUTES).get("Attributes", {})
+                    except SourceError:
+                        attributes = {}
+                    if attributes:
+                        rf_index = enable_user_index(args, names, attributes)
+                        if rf_index is None and getattr(args, "snmp_version", None) == "3" and "snmp" in names and not listing:
+                            print(f"SNMP v3 needs an iDRAC user, and no account named {args.user!r} was found on "
+                                  f"{args.host}", file=sys.stderr)
+                            return 1
+                        wanted = [w for w in enable_wanted(args, names, listing, rf_index) if w[1] in attributes]
+                        state.update({w[1]: attributes[w[1]] for w in wanted})
+                        if not apply_enable(args, wanted, state, lambda todo: get.patch(
+                                ENABLE_ATTRIBUTES, {"Attributes": {w[1]: w[3] for w in todo}}), "Redfish",
+                                lambda w, v: get.patch(ENABLE_ATTRIBUTES, {"Attributes": {w[1]: v}})):
+                            return 1
+            except LoginRefused as e:
+                print(e, file=sys.stderr)
+                return 1
+            except SourceError as e:
+                print(f"Redfish not usable for this ({e}); trying racadm", file=sys.stderr)
+            if not state and rf_index is None:
+                rf_index = enable_user_index(args, names)  # the slot, over racadm
+            wanted = [w for w in enable_wanted(args, names, listing, rf_index) if w[1] not in state]
+            if wanted:
+                for _, key, obj, _ in wanted:
+                    text = racadm_run(args, f"get {obj}")
+                    found = re.search(r"^\s*\w+\s*=\s*(.*\S)", text, re.M)
+                    if not found:
+                        raise SourceError(f"racadm gave no value for {obj}")
+                    state[key] = found.group(1)
+                if not apply_enable(args, wanted, state, lambda todo: [racadm_run(args, f"set {w[2]} {w[3]}") for w in todo],
+                                    "racadm", lambda w, v: racadm_run(args, f"set {w[2]} {v}")):
+                    return 1
+    except SourceError as e:
+        print(f"Could not enable: {e}", file=sys.stderr)
+        return 1
+    chosen = {k: v for k, v in state.items() if re.fullmatch(r"Users\.\d+\.SNMPv3(Authentication|Privacy)Type", k)}
+    if not listing and args.change == "Enabled" and getattr(args, "snmp_version", None) == "3" and len(chosen) == 2:
+        auth, priv = (v.lower() for _, v in sorted(chosen.items(), key=lambda kv: "Privacy" in kv[0]))
+        print(f"Read it with: --source snmp --version 3 --user {args.user} --snmp-auth {auth} --snmp-priv {priv}")
+    if listing:
+        for n in names:
+            label, _, key = ENABLE_FUNCTIONS[n]
+            print(f"{n:8} {'enabled' if enable_state(state.get(key)) else 'disabled':9} {label}")
+            if n == "snmp" and SNMP_PROTOCOL[1] in state:
+                print(f"{'':8} {'':9} protocol: {state[SNMP_PROTOCOL[1]]}")
+    return 0
+
+
+def at_value(current, wanted):
+    """Whether an attribute already has the wanted value (Enabled and Disabled also match 1/0 and true/false)."""
+    if isinstance(wanted, list):
+        return str(current).lower() == wanted[0].lower()
+    if wanted in ("Enabled", "Disabled"):
+        return enable_state(current) == (wanted == "Enabled")
+    return str(current).lower() == wanted.lower()
+
+
+def apply_enable(args, wanted, state, write, how, write_one):
+    """Change the attributes in `wanted` that differ from `state`, after confirming; False if declined.
+
+    `write(todo)` sets a batch of fixed values. For a list of values (the strongest SNMP v3 types), `write_one(item,
+    value)` is tried with each in turn until the iDRAC accepts one; a value the attribute already has ends the search.
+    """
+    todo = [w for w in wanted if w[3] is not None and not at_value(state[w[1]], w[3])]
+    if not todo:
+        return True
+    if not confirm_enable(args, todo):
+        return False
+    fixed = [w for w in todo if not isinstance(w[3], list)]
+    if fixed:
+        write(fixed)
+    for label, key, _, value in fixed:
+        state[key] = value
+        print(f"Set {label} to {value} on {args.host} ({how})")
+    for item in todo:
+        label, key, _, candidates = item
+        if not isinstance(candidates, list):
+            continue
+        last = None
+        for value in candidates:
+            if str(state[key]).lower() == value.lower():
+                break  # already as strong as the iDRAC allows, as far as the stronger ones were refused
+            try:
+                write_one(item, value)
+            except SourceError as e:
+                last = e
+                continue
+            state[key] = value
+            print(f"Set {label} to {value}, the strongest the iDRAC accepted, on {args.host} ({how})")
+            break
+        else:
+            raise SourceError(f"the iDRAC accepted none of {', '.join(candidates)} for {label}: {last}")
+    return True
+
+
+def confirm_enable(args, todo):
+    """Ask before changing an iDRAC's configuration, unless --yes was given."""
+    what = ", ".join(f"{label} -> " + (f"the strongest of {'/'.join(value)}" if isinstance(value, list) else value)
+                     for label, _, _, value in todo)
+    cutting = [n for n in ("web", "redfish", "ssh") if any(ENABLE_FUNCTIONS[n][2] == key for _, key, _, v in todo
+                                                           if v == "Disabled")]
+    if cutting:  # these are the ways ocicat and other tools get in: switching one off can lock you out
+        print(f"Warning: turning off {', '.join(cutting)} can cut off the access ocicat and other tools use to "
+              f"manage {args.host}; it may only be undoable at the console or with another service.", file=sys.stderr)
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        print(f"Would set {what} on {args.host}; run again with --yes to do it", file=sys.stderr)
+        return False
+    return input(f"Set {what} on {args.host}? [y/N] ").strip().lower() in ("y", "yes")
+
+
+# iDRAC privilege bit masks: Login 0x1, Configure iDRAC 0x2, Configure Users 0x4, Clear Logs 0x8, Server Control 0x10,
+# Virtual Console 0x20, Virtual Media 0x40, Test Alerts 0x80, Diagnostics 0x100. The roles are Dell's documented sums.
+ADD_PRIVS = {"read": 0x1, "operator": 0x1f3, "write": 0x1ff, "admin": 0x1ff, "none": 0x0}
+ADD_PRIV_NAMES = {0x1: "Read Only", 0x1f3: "Operator", 0x1ff: "Administrator", 0x0: "no access"}
+ADD_NAME = re.compile(r"[\w.-]{1,16}")
+
+
+def add_privilege(text):
+    """The privilege number for --privs: read, operator, write, admin, none, or a number such as 0x1ff."""
+    text = text.strip().lower()
+    if text in ADD_PRIVS:
+        return ADD_PRIVS[text]
+    try:
+        number = int(text, 0)
+    except ValueError:
+        number = -1
+    if not 0 <= number <= 0x1ff:
+        raise ValueError(f"--privs takes {', '.join(ADD_PRIVS)} or a privilege number from 0 to 0x1ff, not {text!r}")
+    return number
+
+
+def confirm_change(args, text):
+    """Ask before changing an iDRAC, unless --yes was given; the text never holds a password."""
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        print(f"Would {text}; run again with --yes to do it", file=sys.stderr)
+        return False
+    return input(f"{text[0].upper()}{text[1:]}? [y/N] ").strip().lower() in ("y", "yes")
+
+
+def generate_password(length=16):
+    """A random password with upper and lower case letters, digits and a few symbols that every route accepts.
+
+    It has at least one of each kind (iDRAC password rules vary) and no spaces, quotes or backslashes, which racadm
+    cannot take, and it fits the 20 characters an iDRAC8 allows.
+    """
+    kinds = [string.ascii_uppercase, string.ascii_lowercase, string.digits, "-_.+="]
+    chars = [secrets.choice(kind) for kind in kinds]
+    chars += [secrets.choice("".join(kinds)) for _ in range(length - len(chars))]
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
+
+
+def add_user(args):
+    """Create an iDRAC account in the first free slot (2 to 16) with --new-user, --new-pass and --privs.
+
+    Redfish first (a PATCH of the Dell attributes Users.N.*), racadm if Redfish cannot, as with --enable, under
+    idrac_lock; a refused login is final. An existing user name is refused. The password is never printed.
+    """
+    name, privilege = args.new_user, add_privilege(args.privs)
+    password = args.new_pass
+    if not password:
+        # shown before anything is changed, so it is not lost if the change fails half way or the log is the only record
+        password = generate_password()
+        print(f"No --new-pass given: generating a password for {name}.", file=sys.stderr)
+        print(f"Generated password for {name}: {password}", flush=True)
+    args = copy.copy(args)
+    args.source = "racadm"
+    role = ADD_PRIV_NAMES.get(privilege, "custom")
+    describe = f"create user {name} with privileges {role} (0x{privilege:x}) on {args.host}"
+
+    def slot_of(names):  # names: {slot: user name}; returns the first free slot, or raises
+        if name in names.values():
+            raise SourceError(f"{args.host} already has a user named {name}")
+        free = [n for n in range(2, 17) if not names.get(n)]
+        if not free:
+            raise SourceError(f"{args.host} has no free user slot (2 to 16)")
+        return free[0]
+
+    try:
+        with idrac_lock(args):
+            try:
+                with redfish_session(args) as get:
+                    try:
+                        attributes = get(ENABLE_ATTRIBUTES).get("Attributes", {})
+                    except SourceError:
+                        attributes = {}
+                    names = {int(m.group(1)): v for k, v in attributes.items()
+                             if (m := re.fullmatch(r"Users\.(\d+)\.UserName", k))}
+                    if names:
+                        slot = slot_of(names)
+                        if not confirm_change(args, f"{describe}, in slot {slot}"):
+                            return 1
+                        get.patch(ENABLE_ATTRIBUTES, {"Attributes": {
+                            f"Users.{slot}.UserName": name, f"Users.{slot}.Password": password,
+                            f"Users.{slot}.Privilege": privilege, f"Users.{slot}.Enable": "Enabled"}})
+                        if get(ENABLE_ATTRIBUTES).get("Attributes", {}).get(f"Users.{slot}.UserName") != name:
+                            raise SourceError(f"the iDRAC accepted the change but slot {slot} does not show {name}")
+                        print(f"Created user {name} in slot {slot} with privileges {role} (0x{privilege:x}) "
+                              f"on {args.host} (Redfish)")
+                        return 0
+            except LoginRefused as e:
+                print(e, file=sys.stderr)
+                return 1
+            except SourceError as e:
+                if "already has" in str(e) or "no free" in str(e):
+                    raise
+                print(f"Redfish not usable for this ({e}); trying racadm", file=sys.stderr)
+            if re.search(r"[\s\"'\\]", password):
+                raise SourceError("racadm cannot take a password with spaces, quotes or backslashes; "
+                                  "choose another, or use Redfish")
+            names = {}
+            for slot in range(2, 17):
+                text = racadm_run(args, f"get iDRAC.Users.{slot}.UserName")
+                found = re.search(r"^\s*UserName\s*=\s*(.*)$", text, re.M)
+                names[slot] = found.group(1).strip() if found else ""
+            slot = slot_of(names)
+            if not confirm_change(args, f"{describe}, in slot {slot}"):
+                return 1
+            base = f"set iDRAC.Users.{slot}"
+            for step in (f"{base}.UserName {name}", f'{base}.Password "{password}"',
+                         f"{base}.Privilege 0x{privilege:x}", f"{base}.Enable Enabled"):
+                try:
+                    racadm_run(args, step)
+                except SourceError as e:
+                    raise SourceError(f"{step.split()[1].rsplit('.', 1)[1]} failed ({e}); slot {slot} may be "
+                                      f"partly set up: check it with racadm get iDRAC.Users.{slot}")
+            print(f"Created user {name} in slot {slot} with privileges {role} (0x{privilege:x}) on {args.host} (racadm)")
+            return 0
+    except SourceError as e:
+        print(f"Could not add the user: {e}", file=sys.stderr)
+        return 1
+
+
+ADD_FEATURES = {"user": add_user}
 
 
 def wsman_client(args):
@@ -3151,6 +3645,10 @@ def main():
         except (requests.RequestException, SourceError) as e:
             sys.exit(f"Not saving credentials: {e}")
         print(f"Credentials for {args.host} ({saving.source}) saved to the OS keyring", flush=True)
+    if args.add:
+        sys.exit(ADD_FEATURES[args.add](args))
+    if args.enable or args.disable:
+        sys.exit(enable_functions(args))
     if args.list:
         sys.exit(list_all(args))
     if args.get:
