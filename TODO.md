@@ -189,6 +189,24 @@ offered on 2026-10-06:
   `ssh` command fallback and keep the reused connection.
 - [ ] Test fan and voltage sensors over ssh; the remote test machine had temperatures and an ACPI power meter only.
 
+## Changing an iDRAC (`--enable`, `--disable`, `--add`, SNMP versions)
+
+Added 0.5.4 to 0.5.9, tested only against stand-ins. See CLAUDE.md, "Device-changing features".
+
+- [ ] Run them on real hardware (192.168.8.240 first, `--enable list` before anything else) and fix the attribute names
+  and values: `iDRAC.SNMP.AgentEnable`, `SNMPProtocol`, `iDRAC.Users.N.*` (`SNMPv3Enable`, `SNMPv3AuthenticationType`,
+  `SNMPv3PrivacyType`, `UserName`, `Password`, `Privilege`, `Enable`), `iDRAC.Redfish.Enable`, `iDRAC.SSH.Enable`,
+  `iDRAC.WebServer.Enable`, `iDRAC.IPMILan.Enable`, and the values `SHA512`/`SHA384`/`SHA256`/`AES256`/`AES192`.
+- [ ] Does an iDRAC8 (2.86) have the Redfish Attributes resource, and does a write there work? Is WS-Man really only
+  behind the web server?
+- [ ] Does the iDRAC use the user's password as both SNMPv3 keys, and is it re-keyed when the password changes?
+- [ ] `--remove user`, `--add` for an SNMP v3 user in one step, IPMI-over-LAN privilege of a new account.
+- [ ] `--enable snmp --version 3` makes the iDRAC SNMPv3-only; offer a way to keep `All`.
+- [ ] The SNMP v3 reader defaults to sha/aes: auto-detect the account's types, or remember them with the credentials.
+- [ ] A repeat `--enable snmp --version 3` on an account already at the strongest type still tries stronger values and
+  asks again.
+- [ ] Port to `rust/` (not done).
+
 ## racadm
 
 - [ ] racadm can also give telemetry (`racadm getsensorinfo`, `racadm sensorstats`) and the power supply and fan blocks
